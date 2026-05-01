@@ -1,4 +1,3 @@
-using HistoryDB;
 using HistoryDB.Contracts;
 using HistoryDB.Tests.Infrastructure.Contracts;
 using HistoryDB.Tests.Infrastructure.Fixtures;
