@@ -1,0 +1,33 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.37216.2
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HisBench", "HisBench\HisBench.csproj", "{642EAB61-FE1F-4882-AE27-140BCC573201}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HistoryDB", "HistoryDB\HistoryDB.csproj", "{5338EDD1-8982-F254-A2E7-57EF756EF048}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5310B48F-1E5E-4741-9DBA-6C1F90015AA5}.Debug|x64.ActiveCfg = Debug|x64
+		{5310B48F-1E5E-4741-9DBA-6C1F90015AA5}.Debug|x64.Build.0 = Debug|x64
+		{5310B48F-1E5E-4741-9DBA-6C1F90015AA5}.Release|x64.ActiveCfg = Release|x64
+		{5310B48F-1E5E-4741-9DBA-6C1F90015AA5}.Release|x64.Build.0 = Release|x64
+		{642EAB61-FE1F-4882-AE27-140BCC573201}.Debug|x64.ActiveCfg = Debug|x64
+		{642EAB61-FE1F-4882-AE27-140BCC573201}.Debug|x64.Build.0 = Debug|x64
+		{642EAB61-FE1F-4882-AE27-140BCC573201}.Release|x64.ActiveCfg = Release|x64
+		{5338EDD1-8982-F254-A2E7-57EF756EF048}.Debug|x64.ActiveCfg = Debug|x64
+		{5338EDD1-8982-F254-A2E7-57EF756EF048}.Debug|x64.Build.0 = Debug|x64
+		{5338EDD1-8982-F254-A2E7-57EF756EF048}.Release|x64.ActiveCfg = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {5FEE5CE5-425A-4D79-BE2F-1084D97F6C07}
+	EndGlobalSection
+EndGlobal
