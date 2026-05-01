@@ -1,4 +1,4 @@
-# ArticleDatabase
+# ArticlesDB
 
 `ArticleDatabase` is a high-performance, lock-efficient NNTP history storage project focused on very fast deduplication and lookup of article/message identifiers. Built from the ground up for implementation in next generation NNTP servers.
 
