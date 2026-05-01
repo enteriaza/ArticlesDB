@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HisBench", "HisBench\HisBen
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HistoryDB", "HistoryDB\HistoryDB.csproj", "{5338EDD1-8982-F254-A2E7-57EF756EF048}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HistoryDB.Tests", "HistoryDB.Tests\HistoryDB.Tests.csproj", "{E7B3F9A2-4D8C-4B1E-9F6A-2C8E5D1B7A34}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -23,6 +25,10 @@ Global
 		{5338EDD1-8982-F254-A2E7-57EF756EF048}.Debug|x64.ActiveCfg = Debug|x64
 		{5338EDD1-8982-F254-A2E7-57EF756EF048}.Debug|x64.Build.0 = Debug|x64
 		{5338EDD1-8982-F254-A2E7-57EF756EF048}.Release|x64.ActiveCfg = Release|x64
+		{E7B3F9A2-4D8C-4B1E-9F6A-2C8E5D1B7A34}.Debug|x64.ActiveCfg = Debug|x64
+		{E7B3F9A2-4D8C-4B1E-9F6A-2C8E5D1B7A34}.Debug|x64.Build.0 = Debug|x64
+		{E7B3F9A2-4D8C-4B1E-9F6A-2C8E5D1B7A34}.Release|x64.ActiveCfg = Release|x64
+		{E7B3F9A2-4D8C-4B1E-9F6A-2C8E5D1B7A34}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
