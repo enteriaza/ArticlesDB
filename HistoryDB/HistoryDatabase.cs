@@ -11,19 +11,42 @@ namespace HistoryDB;
 /// <summary>
 /// Public HistoryDB entry point. Accepts string message IDs and server IDs, hashes them to MD5 internally, and delegates to the internal shard engine.
 /// </summary>
+/// <remarks>
+/// <para>
+/// The walk/journal subsystem is opt-in for long-running deployments. When enabled, every successful insert appends a UTF-8 line
+/// to <c>history-journal.log</c> and a record to an in-memory ring buffer that backs <see cref="HistoryWalk(ref long, out HistoryWalkEntry, int)"/>.
+/// Disable the journal (<c>enableWalkJournal: false</c>) for high-throughput servers that do not consume the walk API; otherwise tune
+/// <c>maxWalkEntriesInMemory</c> to bound resident memory growth.
+/// </para>
+/// </remarks>
 public sealed class HistoryDatabase
 {
+    /// <summary>Default in-memory walk window. Bounded so very long-running processes do not accumulate unbounded RAM.</summary>
+    public const int DefaultMaxWalkEntriesInMemory = 1_048_576;
+
     private readonly ShardedHistoryWriter _writer;
     private readonly string _expiredPath;
     private readonly string _journalPath;
+    private readonly bool _enableWalkJournal;
+    private readonly int _maxWalkEntriesInMemory;
     private readonly object _stateLock = new();
     private readonly object _journalWriteLock = new();
     private readonly HashSet<Hash128> _expired = [];
-    private readonly List<HistoryWalkEntry> _walkEntries = [];
+    private readonly LinkedList<HistoryWalkEntry> _walkEntries = new();
+    private long _walkEntriesEvicted;
 
     /// <summary>
     /// Initializes a HistoryDB instance and activates internal generation processing.
     /// </summary>
+    /// <param name="rootPath">Root directory for shard data, Bloom sidecars, and metadata.</param>
+    /// <param name="shardCount">Shard count.</param>
+    /// <param name="slotsPerShard">Slots per shard (power of two).</param>
+    /// <param name="maxLoadFactorPercent">Maximum load factor percent for inserts.</param>
+    /// <param name="queueCapacityPerShard">Bounded channel capacity per shard.</param>
+    /// <param name="maxRetainedGenerations">Generations retained before retiring oldest.</param>
+    /// <param name="enableWalkJournal">When <see langword="true"/> (default), persists the journal and tracks an in-memory walk buffer; disable for high-throughput servers that do not use <see cref="HistoryWalk(ref long, out HistoryWalkEntry, int)"/>.</param>
+    /// <param name="maxWalkEntriesInMemory">FIFO bound on resident walk entries. Use <c>0</c> for unbounded (legacy behavior); legacy mode is only safe for short-lived processes because the list grows with every insert.</param>
+    /// <param name="logger">Optional structured logger.</param>
     public HistoryDatabase(
         string rootPath,
         int shardCount = 128,
@@ -31,8 +54,15 @@ public sealed class HistoryDatabase
         ulong maxLoadFactorPercent = 75,
         int queueCapacityPerShard = 1_000_000,
         int maxRetainedGenerations = 8,
+        bool enableWalkJournal = true,
+        int maxWalkEntriesInMemory = DefaultMaxWalkEntriesInMemory,
         ILogger? logger = null)
     {
+        if (maxWalkEntriesInMemory < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxWalkEntriesInMemory), "maxWalkEntriesInMemory must be >= 0 (0 = unbounded).");
+        }
+
         _writer = new ShardedHistoryWriter(
             rootPath: rootPath,
             shardCount: shardCount,
@@ -46,8 +76,13 @@ public sealed class HistoryDatabase
         Directory.CreateDirectory(normalizedRoot);
         _expiredPath = Path.Combine(normalizedRoot, "expired-md5.bin");
         _journalPath = Path.Combine(normalizedRoot, "history-journal.log");
+        _enableWalkJournal = enableWalkJournal;
+        _maxWalkEntriesInMemory = maxWalkEntriesInMemory;
         LoadExpiredSet();
-        LoadJournal();
+        if (_enableWalkJournal)
+        {
+            LoadJournal();
+        }
     }
 
     /// <summary>
@@ -79,20 +114,55 @@ public sealed class HistoryDatabase
 
         Hash128 messageHash = ComputeMd5(messageId);
         Hash128 serverHash = ComputeMd5(serverId);
-        ShardInsertResult result = _writer.EnqueueAsync(messageHash.Hi, messageHash.Lo, serverHash.Hi, serverHash.Lo).AsTask().GetAwaiter().GetResult();
+        ShardInsertResult result = WaitEnqueue(_writer.EnqueueAsync(messageHash.Hi, messageHash.Lo, serverHash.Hi, serverHash.Lo));
         if (result == ShardInsertResult.Inserted)
         {
-            lock (_stateLock)
+            if (_enableWalkJournal)
             {
-                _expired.Remove(messageHash);
-                _walkEntries.Add(new HistoryWalkEntry(messageId, serverId, DateTimeOffset.UtcNow));
+                lock (_stateLock)
+                {
+                    _expired.Remove(messageHash);
+                    AppendWalkEntry_NoLock(new HistoryWalkEntry(messageId, serverId, DateTimeOffset.UtcNow));
+                }
+
+                AppendJournalLine(messageId, serverId);
+            }
+            else
+            {
+                lock (_stateLock)
+                {
+                    _expired.Remove(messageHash);
+                }
             }
 
-            AppendJournalLine(messageId, serverId);
             return true;
         }
 
         return false;
+    }
+
+    private static ShardInsertResult WaitEnqueue(ValueTask<ShardInsertResult> pending)
+    {
+        if (pending.IsCompletedSuccessfully)
+        {
+            return pending.Result;
+        }
+
+        // Hop to the thread pool first so any captured SynchronizationContext on the caller cannot deadlock with continuations.
+        return Task.Run(async () => await pending.ConfigureAwait(false)).GetAwaiter().GetResult();
+    }
+
+    private void AppendWalkEntry_NoLock(HistoryWalkEntry entry)
+    {
+        _walkEntries.AddLast(entry);
+        if (_maxWalkEntriesInMemory > 0)
+        {
+            while (_walkEntries.Count > _maxWalkEntriesInMemory)
+            {
+                _walkEntries.RemoveFirst();
+                _walkEntriesEvicted++;
+            }
+        }
     }
 
     /// <summary>
@@ -170,13 +240,41 @@ public sealed class HistoryDatabase
     /// <summary>
     /// Procedural walk API. Returns 1 when an entry is produced; returns 0 when end is reached.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <paramref name="position"/> is a logical cursor that is invariant across FIFO eviction of the in-memory walk window:
+    /// when older entries are evicted, the cursor automatically advances past them (treated as already-walked) so callers do
+    /// not see corrupted ordering. <see cref="GetEvictedWalkEntryCount"/> reports how many entries have been evicted in total.
+    /// </para>
+    /// </remarks>
     public int HistoryWalk(ref long position, out HistoryWalkEntry entry, int flags = 0)
     {
         lock (_stateLock)
         {
-            while (position >= 0 && position < _walkEntries.Count)
+            // Translate a logical cursor into the resident window, skipping any entries that have already been evicted.
+            if (position < _walkEntriesEvicted)
             {
-                HistoryWalkEntry current = _walkEntries[(int)position++];
+                position = _walkEntriesEvicted;
+            }
+
+            long localIndex = position - _walkEntriesEvicted;
+            if (localIndex < 0 || localIndex >= _walkEntries.Count)
+            {
+                entry = default;
+                return 0;
+            }
+
+            LinkedListNode<HistoryWalkEntry>? node = _walkEntries.First;
+            for (long i = 0; i < localIndex && node is not null; i++)
+            {
+                node = node.Next;
+            }
+
+            while (node is not null)
+            {
+                HistoryWalkEntry current = node.Value;
+                position++;
+                node = node.Next;
                 if (_expired.Contains(ComputeMd5(current.MessageId)))
                 {
                     continue;
@@ -189,6 +287,23 @@ public sealed class HistoryDatabase
 
         entry = default;
         return 0;
+    }
+
+    /// <summary>
+    /// Returns the number of walk entries evicted from the in-memory window since process start (FIFO retention).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Useful for diagnostics on long-running deployments to confirm that <c>maxWalkEntriesInMemory</c> is not silently dropping
+    /// records that downstream consumers expect to walk. The on-disk journal still contains the full history.
+    /// </para>
+    /// </remarks>
+    public long GetEvictedWalkEntryCount()
+    {
+        lock (_stateLock)
+        {
+            return _walkEntriesEvicted;
+        }
     }
 
     /// <summary>
@@ -269,6 +384,9 @@ public sealed class HistoryDatabase
             return;
         }
 
+        // StreamReader (used by File.ReadLines) handles both \n and \r\n so journals written on the other platform load correctly.
+        long resident = 0;
+        long total = 0;
         foreach (string line in File.ReadLines(_journalPath))
         {
             string[] parts = line.Split('|');
@@ -277,23 +395,46 @@ public sealed class HistoryDatabase
                 continue;
             }
 
-            string messageId = Encoding.UTF8.GetString(Convert.FromBase64String(parts[0]));
-            string serverId = Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]));
-            if (!long.TryParse(parts[2], out long ticks))
+            string messageId;
+            string serverId;
+            try
+            {
+                messageId = Encoding.UTF8.GetString(Convert.FromBase64String(parts[0]));
+                serverId = Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]));
+            }
+            catch (FormatException)
             {
                 continue;
             }
 
-            _walkEntries.Add(new HistoryWalkEntry(messageId, serverId, new DateTimeOffset(ticks, TimeSpan.Zero)));
+            if (!long.TryParse(parts[2], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out long ticks))
+            {
+                continue;
+            }
+
+            total++;
+            _walkEntries.AddLast(new HistoryWalkEntry(messageId, serverId, new DateTimeOffset(ticks, TimeSpan.Zero)));
+            resident++;
+            if (_maxWalkEntriesInMemory > 0 && resident > _maxWalkEntriesInMemory)
+            {
+                _walkEntries.RemoveFirst();
+                resident--;
+                _walkEntriesEvicted++;
+            }
         }
+
+        _ = total;
     }
 
     private void AppendJournalLine(string messageId, string serverId)
     {
-        string line = $"{Convert.ToBase64String(Encoding.UTF8.GetBytes(messageId))}|{Convert.ToBase64String(Encoding.UTF8.GetBytes(serverId))}|{DateTimeOffset.UtcNow.Ticks}";
+        // Use '\n' explicitly (not Environment.NewLine) so journal files round-trip identically between Windows and Linux deployments.
+        string line = string.Create(
+            System.Globalization.CultureInfo.InvariantCulture,
+            $"{Convert.ToBase64String(Encoding.UTF8.GetBytes(messageId))}|{Convert.ToBase64String(Encoding.UTF8.GetBytes(serverId))}|{DateTimeOffset.UtcNow.Ticks}\n");
         lock (_journalWriteLock)
         {
-            File.AppendAllText(_journalPath, line + Environment.NewLine);
+            File.AppendAllText(_journalPath, line);
         }
     }
 

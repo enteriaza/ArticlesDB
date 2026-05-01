@@ -1177,12 +1177,46 @@ internal sealed partial class ShardedHistoryWriter
         _activeGenerationId = generationId;
         LogGenerationActivated(generationId);
 
+        // Sweep finished retire tasks so the list does not grow unbounded over the lifetime of a long-running process.
+        // Each retired task captures a GenerationState (shard arrays, queues, blooms) via closure; pruning lets the GC reclaim it.
+        PruneCompletedRetiredCleanupTasks_NoLock();
+
         while (_generations.Count > _maxRetainedGenerations)
         {
             GenerationState retired = _generations[0];
             _generations.RemoveAt(0);
             _retiredGenerationCleanupTasks.Add(Task.Run(() => RetireGenerationAsync(retired)));
             LogRetireScheduled(retired.GenerationId);
+        }
+    }
+
+    private void PruneCompletedRetiredCleanupTasks_NoLock()
+    {
+        if (_retiredGenerationCleanupTasks.Count == 0)
+        {
+            return;
+        }
+
+        int writeIndex = 0;
+        for (int readIndex = 0; readIndex < _retiredGenerationCleanupTasks.Count; readIndex++)
+        {
+            Task task = _retiredGenerationCleanupTasks[readIndex];
+            if (task.IsCompleted)
+            {
+                continue;
+            }
+
+            if (writeIndex != readIndex)
+            {
+                _retiredGenerationCleanupTasks[writeIndex] = task;
+            }
+
+            writeIndex++;
+        }
+
+        if (writeIndex < _retiredGenerationCleanupTasks.Count)
+        {
+            _retiredGenerationCleanupTasks.RemoveRange(writeIndex, _retiredGenerationCleanupTasks.Count - writeIndex);
         }
     }
 

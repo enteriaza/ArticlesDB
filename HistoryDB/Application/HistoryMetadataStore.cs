@@ -1,5 +1,6 @@
 // HistoryMetadataStore.cs -- durable walk/expiry metadata store for the public HistoryDatabase API.
 
+using System.Globalization;
 using System.Text;
 
 using HistoryDB.Contracts;
@@ -14,15 +15,21 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
     private readonly object _stateLock = new();
     private readonly object _journalWriteLock = new();
     private readonly HashSet<Hash128> _expired = [];
-    private readonly List<JournalEntry> _walkEntries = [];
+    private readonly LinkedList<JournalEntry> _walkEntries = new();
     private readonly IMessageHashProvider _hashProvider;
     private readonly ILogger _logger;
+    private readonly int _maxWalkEntriesInMemory;
+    private long _walkEntriesEvicted;
 
-    public HistoryMetadataStore(string rootPath, IMessageHashProvider hashProvider, ILogger logger)
+    public HistoryMetadataStore(string rootPath, IMessageHashProvider hashProvider, ILogger logger, int maxWalkEntriesInMemory = 1_048_576)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(rootPath);
         ArgumentNullException.ThrowIfNull(hashProvider);
         ArgumentNullException.ThrowIfNull(logger);
+        if (maxWalkEntriesInMemory < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxWalkEntriesInMemory), "maxWalkEntriesInMemory must be >= 0 (0 = unbounded).");
+        }
 
         string normalizedRoot = Path.GetFullPath(rootPath);
         Directory.CreateDirectory(normalizedRoot);
@@ -30,6 +37,7 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
         _journalPath = Path.Combine(normalizedRoot, "history-journal.log");
         _hashProvider = hashProvider;
         _logger = logger;
+        _maxWalkEntriesInMemory = maxWalkEntriesInMemory;
 
         LoadExpiredSet();
         LoadJournal();
@@ -48,7 +56,7 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
         lock (_stateLock)
         {
             _expired.Remove(messageHash);
-            _walkEntries.Add(new JournalEntry(new HistoryWalkEntry(messageId, serverId, createdAtUtc), messageHash));
+            AppendWalkEntry_NoLock(new JournalEntry(new HistoryWalkEntry(messageId, serverId, createdAtUtc), messageHash));
         }
 
         AppendJournalLine(messageId, serverId, messageHash, createdAtUtc);
@@ -100,9 +108,29 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
     {
         lock (_stateLock)
         {
-            while (position >= 0 && position < _walkEntries.Count)
+            if (position < _walkEntriesEvicted)
             {
-                JournalEntry current = _walkEntries[(int)position++];
+                position = _walkEntriesEvicted;
+            }
+
+            long localIndex = position - _walkEntriesEvicted;
+            if (localIndex < 0 || localIndex >= _walkEntries.Count)
+            {
+                entry = default;
+                return 0;
+            }
+
+            LinkedListNode<JournalEntry>? node = _walkEntries.First;
+            for (long i = 0; i < localIndex && node is not null; i++)
+            {
+                node = node.Next;
+            }
+
+            while (node is not null)
+            {
+                JournalEntry current = node.Value;
+                position++;
+                node = node.Next;
                 if (_expired.Contains(current.MessageHash))
                 {
                     continue;
@@ -150,7 +178,20 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
                 continue;
             }
 
-            _walkEntries.Add(entry);
+            AppendWalkEntry_NoLock(entry);
+        }
+    }
+
+    private void AppendWalkEntry_NoLock(JournalEntry entry)
+    {
+        _walkEntries.AddLast(entry);
+        if (_maxWalkEntriesInMemory > 0)
+        {
+            while (_walkEntries.Count > _maxWalkEntriesInMemory)
+            {
+                _walkEntries.RemoveFirst();
+                _walkEntriesEvicted++;
+            }
         }
     }
 
@@ -167,7 +208,7 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
         {
             string messageId = Encoding.UTF8.GetString(Convert.FromBase64String(parts[0]));
             string serverId = Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]));
-            if (!long.TryParse(parts[2], out long ticks))
+            if (!long.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out long ticks))
             {
                 return false;
             }
@@ -175,8 +216,8 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
             Hash128 messageHash;
             if (parts.Length == 5)
             {
-                if (!ulong.TryParse(parts[3], out ulong hashHi) ||
-                    !ulong.TryParse(parts[4], out ulong hashLo))
+                if (!ulong.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong hashHi) ||
+                    !ulong.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong hashLo))
                 {
                     return false;
                 }
@@ -201,13 +242,14 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
 
     private void AppendJournalLine(string messageId, string serverId, Hash128 messageHash, DateTimeOffset createdAtUtc)
     {
+        // Always emit '\n' (not Environment.NewLine) so journal files migrate cleanly between Windows and Linux hosts.
         string line = string.Create(
-            System.Globalization.CultureInfo.InvariantCulture,
-            $"{Convert.ToBase64String(Encoding.UTF8.GetBytes(messageId))}|{Convert.ToBase64String(Encoding.UTF8.GetBytes(serverId))}|{createdAtUtc.Ticks}|{messageHash.Hi}|{messageHash.Lo}");
+            CultureInfo.InvariantCulture,
+            $"{Convert.ToBase64String(Encoding.UTF8.GetBytes(messageId))}|{Convert.ToBase64String(Encoding.UTF8.GetBytes(serverId))}|{createdAtUtc.Ticks}|{messageHash.Hi}|{messageHash.Lo}\n");
 
         lock (_journalWriteLock)
         {
-            File.AppendAllText(_journalPath, line + Environment.NewLine);
+            File.AppendAllText(_journalPath, line);
         }
     }
 

@@ -15,7 +15,9 @@ internal sealed class ProcessTelemetryReader : IProcessTelemetryReader
 
     public ProcessResourceSnapshot ReadCurrent()
     {
-        Process process = Process.GetCurrentProcess();
+        // Process.GetCurrentProcess() opens a new OS handle every call; without disposing, repeated sampling under
+        // long-running benchmarks (auto-tune sweeps, sustained correlation samplers) leaks handles on both Windows and Linux.
+        using Process process = Process.GetCurrentProcess();
         process.Refresh();
 
         bool hasIo = TryGetIoBytes(process, out long readBytes, out long writeBytes);
