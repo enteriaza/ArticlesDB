@@ -2,6 +2,8 @@
 
 This document explains how **generations**, **shards**, **slot tables**, **load factor**, **Bloom filters**, and **`maxRetainedGenerations`** interact. It gives **closed-form estimates** so you can size `HistoryDatabase` / `ShardedHistoryWriter` for target insert rates, disk footprint, and—critically—**how long a Message-ID (or other hashed key) remains visible to lookup and duplicate checks**.
 
+**Math on GitHub:** Inline math uses `$…$`; display equations use a `$$` line, the block, then a closing `$$` line. See [Writing mathematical expressions](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/writing-mathematical-expressions). LaTeX-style `\[…\]` and `\(…\)` delimiters are **not** rendered on GitHub, so this document uses `$` / `$$` instead.
+
 > **Scope:** On-disk and in-process structures owned by `ShardedHistoryWriter` and `HistoryShard`. Optional **walk journal** / metadata growth is mentioned separately; it is not part of the mmap generation math.
 
 ---
@@ -10,18 +12,18 @@ This document explains how **generations**, **shards**, **slot tables**, **load 
 
 | Symbol | Meaning | Typical source |
 |--------|---------|------------------|
-| \(S\) | **Shard count** | `HistoryDatabase` ctor `shardCount` (default **128**) |
-| \(N\) | **Slots per shard** (power of two) | `slotsPerShard` (default **\(2^{22}\)** = 4 194 304) |
-| \(L\) | **Max load factor** (percent, 1–99) | `maxLoadFactorPercent` (default **75**) |
-| \(G\) | **Max retained generations** | `maxRetainedGenerations` (default **8**) |
-| \(H\) | Shard file header bytes | Fixed **64** (`HistoryShard`) |
-| \(E\) | Bytes per occupied slot row | Fixed **32** (`HistoryShard`) |
-| \(b_{\mathrm{target}}\) | Target Bloom bits per *expected* inserted entry | `DefaultBloomBitsPerEntry` = **10** |
-| \(f\) | Bloom RAM fraction of detected physical RAM | Default **0.80** (`DefaultBloomMemoryFraction`) |
-| \(B\) | Optional explicit Bloom budget (bytes); `0` = derive from RAM × \(f\) | `bloomMemoryBudgetBytes` on writer |
-| \(g\) | Generation index when sizing Bloom for the *next* open generation | Writer uses `nextGenerationCount =` current open count **+ 1** |
+| $S$ | **Shard count** | `HistoryDatabase` ctor `shardCount` (default **128**) |
+| $N$ | **Slots per shard** (power of two) | `slotsPerShard` (default **$2^{22}$** = 4 194 304) |
+| $L$ | **Max load factor** (percent, 1–99) | `maxLoadFactorPercent` (default **75**) |
+| $G$ | **Max retained generations** | `maxRetainedGenerations` (default **8**) |
+| $H$ | Shard file header bytes | Fixed **64** (`HistoryShard`) |
+| $E$ | Bytes per occupied slot row | Fixed **32** (`HistoryShard`) |
+| $b_{\mathrm{target}}$ | Target Bloom bits per *expected* inserted entry | `DefaultBloomBitsPerEntry` = **10** |
+| $f$ | Bloom RAM fraction of detected physical RAM | Default **0.80** (`DefaultBloomMemoryFraction`) |
+| $B$ | Optional explicit Bloom budget (bytes); `0` = derive from RAM × $f$ | `bloomMemoryBudgetBytes` on writer |
+| $g$ | Generation index when sizing Bloom for the *next* open generation | Writer uses `nextGenerationCount =` current open count **+ 1** |
 
-**Integer division** in the implementation matches C# `/` on non-negative integers: \(\lfloor x \rfloor\) for quotients.
+**Integer division** in the implementation matches C# `/` on non-negative integers: $\lfloor x \rfloor$ for quotients.
 
 ---
 
@@ -31,9 +33,9 @@ Each shard is one memory-mapped open-addressing table.
 
 ### 2.1 Load limit (inserts rejected as “full” per shard)
 
-\[
+$$
 N_{\mathrm{lim}} = \left\lfloor \frac{N \cdot L}{100} \right\rfloor
-\]
+$$
 
 Implemented as `(tableSize * maxLoadFactor) / 100` in `HistoryShard` (integer division).
 
@@ -41,25 +43,25 @@ Implemented as `(tableSize * maxLoadFactor) / 100` in `HistoryShard` (integer di
 
 The file is **fully allocated** at creation:
 
-\[
+$$
 \mathrm{bytes}_{\mathrm{shard.dat}} = H + E \cdot N = 64 + 32\,N
-\]
+$$
 
 ### 2.3 One generation — total `.dat` bytes (all shards)
 
-\[
+$$
 \mathrm{Disk}_{\mathrm{dat}}(S,N) = S \cdot (64 + 32\,N)
-\]
+$$
 
-For defaults \(S=128\), \(N=2^{22}\):
+For defaults $S=128$, $N=2^{22}$:
 
-\[
+$$
 64 + 32 \cdot 4\,194\,304 = 134\,217\,792 \text{ bytes per shard } \approx 128\ \mathrm{MiB}
-\]
+$$
 
-\[
+$$
 128 \cdot 134\,217\,792 = 17\,179\,889\,152 \text{ bytes} = 16\ \mathrm{GiB\ (exactly,\ binary)}
-\]
+$$
 
 ---
 
@@ -69,33 +71,33 @@ Each **new** insert occupies **at most one slot** in **one** shard (chosen by `h
 
 ### 3.1 Maximum inserted rows before the generation is “full”
 
-Under uniform routing, the soft limit is when **every** shard reaches \(N_{\mathrm{lim}}\):
+Under uniform routing, the soft limit is when **every** shard reaches $N_{\mathrm{lim}}$:
 
-\[
+$$
 K_{\mathrm{gen}} = S \cdot N_{\mathrm{lim}} = S \cdot \left\lfloor \frac{N \cdot L}{100} \right\rfloor
-\]
+$$
 
 **Defaults:**
 
-\[
+$$
 N_{\mathrm{lim}} = \left\lfloor \frac{4\,194\,304 \cdot 75}{100} \right\rfloor = 3\,145\,728
-\]
+$$
 
-\[
+$$
 K_{\mathrm{gen}} = 128 \cdot 3\,145\,728 = 402\,653\,184 \approx 4.03 \times 10^8
-\]
+$$
 
 So **one full generation** holds on the order of **400 M** distinct stored hashes (Message-IDs, after hashing), not counting duplicates rejected before insert.
 
 ### 3.2 Total distinct keys visible across **all retained** generations
 
-At any time the writer keeps at most **\(G\)** generations open. A given Message-ID should exist in **at most one** generation (dedupe prevents re-insert elsewhere). In the worst case (every generation filled to its load limit with **disjoint** keys):
+At any time the writer keeps at most **$G$** generations open. A given Message-ID should exist in **at most one** generation (dedupe prevents re-insert elsewhere). In the worst case (every generation filled to its load limit with **disjoint** keys):
 
-\[
+$$
 K_{\mathrm{hot,max}} \le G \cdot K_{\mathrm{gen}}
-\]
+$$
 
-**Defaults:** \(8 \cdot 402\,653\,184 \approx 3.22 \times 10^9\) distinct keys.
+**Defaults:** $8 \cdot 402\,653\,184 \approx 3.22 \times 10^9$ distinct keys.
 
 That is an **upper bound**; real unions are smaller if generations roll before filling, or if traffic is duplicate-heavy.
 
@@ -107,59 +109,59 @@ That is an **upper bound**; real unions are smaller if generations roll before f
 
 Expected inserted entries per shard at load limit:
 
-\[
+$$
 E_{\mathrm{shard}} = N_{\mathrm{lim}} = \left\lfloor \frac{N \cdot L}{100} \right\rfloor
-\]
+$$
 
 Target Bloom bits (before budget / floor / power-of-two rounding):
 
-\[
+$$
 B_{\mathrm{target}} = \left\lceil E_{\mathrm{shard}} \cdot b_{\mathrm{target}} \right\rceil
-\]
+$$
 
 (`BloomSizingPolicy.ComputeTargetBitsByEntries`.)
 
 ### 4.2 RAM budget bits **per shard** for the **next** generation opening
 
-When `bloomMemoryBudgetBytes` is **0**, the writer uses a fraction \(f\) of installed physical RAM (see `SystemMemoryReader.GetInstalledMemoryBytesForBloomBudget`). Let \(R_{\mathrm{ram}}\) be that byte estimate.
+When `bloomMemoryBudgetBytes` is **0**, the writer uses a fraction $f$ of installed physical RAM (see `SystemMemoryReader.GetInstalledMemoryBytesForBloomBudget`). Let $R_{\mathrm{ram}}$ be that byte estimate.
 
-\[
+$$
 B_{\mathrm{budget}} = 8 \cdot \begin{cases}
 B & B > 0 \text{ (explicit budget)} \\
 \lfloor f \cdot R_{\mathrm{ram}} \rfloor & \text{otherwise}
 \end{cases}
 \quad\text{(bits)}
-\]
+$$
 
 Shard-generation product for the **denominator** when opening the next generation:
 
-\[
+$$
 P = S \cdot g \quad\text{where}\quad g = \text{``current generation count + 1''}
-\]
+$$
 
-\[
+$$
 B_{\mathrm{perShardBudget}} = \left\lfloor \frac{B_{\mathrm{budget}}}{P} \right\rfloor
-\]
+$$
 
 (`BloomSizingPolicy.ComputeBudgetBitsPerShard`.)
 
 ### 4.3 Desired bits and hard floor
 
-\[
+$$
 B_{\mathrm{raw}} = \min(B_{\mathrm{target}},\ B_{\mathrm{perShardBudget}})
-\]
+$$
 
-\[
+$$
 B_{\mathrm{clamped}} = \max(B_{\mathrm{raw}},\ 2^{24}) \quad\text{(minimum }2^{24}\text{ bits = 16\,777\,216)}
-\]
+$$
 
 (`MinBloomBitsPerShard`.)
 
 ### 4.4 Final Bloom bit width (power of two)
 
-\[
+$$
 B_{\mathrm{final}} = \text{largest power of two } \le B_{\mathrm{clamped}}
-\]
+$$
 
 (`BitOperationsUtil.RoundDownToPowerOfTwo` → `bloomBitsPerShard`.)
 
@@ -167,17 +169,17 @@ B_{\mathrm{final}} = \text{largest power of two } \le B_{\mathrm{clamped}}
 
 Layout (see `BloomSidecarFile`): 24-byte header + `wordCount` × 8 bytes + 4-byte CRC, with `wordCount = B_{\mathrm{final}} / 64`.
 
-\[
+$$
 \mathrm{bytes}_{\mathrm{shard.idx}} = 24 + 8 \cdot \frac{B_{\mathrm{final}}}{64} + 4 = 28 + \frac{B_{\mathrm{final}}}{8}
-\]
+$$
 
 **Per generation:**
 
-\[
+$$
 \mathrm{Disk}_{\mathrm{idx}}(S, B_{\mathrm{final}}) = S \cdot \left(28 + \frac{B_{\mathrm{final}}}{8}\right)
-\]
+$$
 
-For defaults, \(B_{\mathrm{final}}\) is typically **`2^24`** after rounding down from the \(\approx 3.15 \times 10^7\) target—so \(\approx 2\ \mathrm{MiB}\) per shard, \(\approx 256\ \mathrm{MiB}\) per generation across 128 shards (order of magnitude).
+For defaults, $B_{\mathrm{final}}$ is typically **`2^24`** after rounding down from the $\approx 3.15 \times 10^7$ target—so $\approx 2\ \mathrm{MiB}$ per shard, $\approx 256\ \mathrm{MiB}$ per generation across 128 shards (order of magnitude).
 
 ### 4.6 Important coupling
 
@@ -187,11 +189,11 @@ Bloom bits per shard **shrink** as **`g` grows** if RAM budget is fixed: opening
 
 ## 5. Total generation footprint (mmap + Bloom only)
 
-\[
+$$
 \mathrm{Disk}_{\mathrm{gen}}(S,N,B_{\mathrm{final}}) = \mathrm{Disk}_{\mathrm{dat}}(S,N) + \mathrm{Disk}_{\mathrm{idx}}(S,B_{\mathrm{final}})
-\]
+$$
 
-**Order of magnitude, defaults:** \(\mathrm{Disk}_{\mathrm{dat}} \approx 16\ \mathrm{GiB}\) + Bloom sidecars \(\approx 0.25\ \mathrm{GiB}\) → **\(\approx 16.25\ \mathrm{GiB}\)** per generation (binary gigabytes).
+**Order of magnitude, defaults:** $\mathrm{Disk}_{\mathrm{dat}} \approx 16\ \mathrm{GiB}$ + Bloom sidecars $\approx 0.25\ \mathrm{GiB}$ → **$\approx 16.25\ \mathrm{GiB}$** per generation (binary gigabytes).
 
 ---
 
@@ -199,46 +201,46 @@ Bloom bits per shard **shrink** as **`g` grows** if RAM budget is fixed: opening
 
 ### 6.1 Logical retention (Message-ID still answers “yes”)
 
-A Message-ID is visible to **`HistoryLookup`** / duplicate checks **iff** the generation that holds it is still in the writer’s **retained generation list** (at most **\(G\)** generations). When the oldest generation is removed from that list, **lookups stop seeing keys that existed only there**, even if raw files may still exist on disk until asynchronous retire cleanup finishes.
+A Message-ID is visible to **`HistoryLookup`** / duplicate checks **iff** the generation that holds it is still in the writer’s **retained generation list** (at most **$G$** generations). When the oldest generation is removed from that list, **lookups stop seeing keys that existed only there**, even if raw files may still exist on disk until asynchronous retire cleanup finishes.
 
 So:
 
-\[
+$$
 \text{Wall-clock retention} \neq \text{Disk size alone}
-\]
+$$
 
-It is bounded by **how long a key stays inside the sliding window of \(\le G\) generations** the process keeps open.
+It is bounded by **how long a key stays inside the sliding window of $\le G$ generations** the process keeps open.
 
 ### 6.2 Relating wall time to rollover (engineering estimate)
 
 Let:
 
-- \(\lambda_{\mathrm{ins}}\) = average rate of **successful inserts** (new rows) across all shards, in inserts/sec.
+- $\lambda_{\mathrm{ins}}$ = average rate of **successful inserts** (new rows) across all shards, in inserts/sec.
 - Ignore duplicates for a **worst-case fill-time upper bound**: duplicates do not consume new slots.
 
 **Time to fill one generation to its load limit (rough order):**
 
-\[
+$$
 T_{\mathrm{fill}} \approx \frac{K_{\mathrm{gen}}}{\lambda_{\mathrm{ins}}}
-\]
+$$
 
-**Time until the oldest of \(G\) generations could be retired** (worst case, rolling as fast as generations fill, one active writer path):
+**Time until the oldest of $G$ generations could be retired** (worst case, rolling as fast as generations fill, one active writer path):
 
-\[
+$$
 T_{\mathrm{window}} \approx G \cdot T_{\mathrm{fill}} \approx \frac{G \cdot K_{\mathrm{gen}}}{\lambda_{\mathrm{ins}}}
-\]
+$$
 
-That \(T_{\mathrm{window}}\) is **not** a guarantee from the code—it is a **capacity planning heuristic**: if you need Message-IDs to remain dedupe-visible for **at least** \(T_{\mathrm{req}}\) seconds, you need the **hot** key set and rollover pattern such that keys are not evicted earlier—typically by increasing \(G\), and/or increasing \(K_{\mathrm{gen}}\) (larger \(N\) and/or \(S\) and/or \(L\)), and/or reducing how fast **new** keys consume slots (lower \(\lambda_{\mathrm{ins}}\)).
+That $T_{\mathrm{window}}$ is **not** a guarantee from the code—it is a **capacity planning heuristic**: if you need Message-IDs to remain dedupe-visible for **at least** $T_{\mathrm{req}}$ seconds, you need the **hot** key set and rollover pattern such that keys are not evicted earlier—typically by increasing $G$, and/or increasing $K_{\mathrm{gen}}$ (larger $N$ and/or $S$ and/or $L$), and/or reducing how fast **new** keys consume slots (lower $\lambda_{\mathrm{ins}}$).
 
 ### 6.3 Total historical generations on disk (cold storage)
 
-If you never delete retired folders externally, **cumulative** generation count \(n_{\mathrm{cum}}\) can be large. **Disk** for all `.dat` files (if all kept) scales:
+If you never delete retired folders externally, **cumulative** generation count $n_{\mathrm{cum}}$ can be large. **Disk** for all `.dat` files (if all kept) scales:
 
-\[
+$$
 \mathrm{Disk}_{\mathrm{all.dat}} \approx n_{\mathrm{cum}} \cdot S \cdot (64 + 32\,N)
-\]
+$$
 
-Only **up to \(G\)** of those generations participate in **live** lookup at once.
+Only **up to $G$** of those generations participate in **live** lookup at once.
 
 ---
 
@@ -246,49 +248,49 @@ Only **up to \(G\)** of those generations participate in **live** lookup at once
 
 ### 7.1 Duplicate check before enqueue (`HistoryCrossGenerationDuplicateCheck.Full`)
 
-For each candidate insert, the writer can walk **up to the number of open generations** (≤ \(G\)), and for **one shard per generation** (the shard selected by `hashLo`), using Bloom short-circuit then possibly `Exists` on mmap.
+For each candidate insert, the writer can walk **up to the number of open generations** (≤ $G$), and for **one shard per generation** (the shard selected by `hashLo`), using Bloom short-circuit then possibly `Exists` on mmap.
 
-**Order (retained generations):** \(O(\min(G, g_{\mathrm{open}}))\) Bloom checks + up to the same order of shard probes in the worst Bloom-ambiguous case.
+**Order (retained generations):** $O(\min(G, g_{\mathrm{open}}))$ Bloom checks + up to the same order of shard probes in the worst Bloom-ambiguous case.
 
-**Not** \(O(\text{total historical inserts})\).
+**Not** $O(\text{total historical inserts})$.
 
 ### 7.2 Probe path inside one shard
 
-Cost grows with **local occupancy** as tables approach \(L\%\). That is **per-generation**, not directly with total cold disk.
+Cost grows with **local occupancy** as tables approach $L\%$. That is **per-generation**, not directly with total cold disk.
 
 ---
 
 ## 8. Sizing recipes (worked patterns)
 
-### 8.1 “How big must \(N\) and \(S\) be for one generation to hold \(K_{\mathrm{target}}\) inserts?”
+### 8.1 “How big must $N$ and $S$ be for one generation to hold $K_{\mathrm{target}}$ inserts?”
 
 You need:
 
-\[
+$$
 S \cdot \left\lfloor \frac{N \cdot L}{100} \right\rfloor \ge K_{\mathrm{target}}
-\]
+$$
 
-Pick **power-of-two** \(N\), choose \(S\), verify \(L\). Remember **\(S\) and \(N\) are fixed for a given root**; changing them effectively requires a **new** dataset layout.
+Pick **power-of-two** $N$, choose $S$, verify $L$. Remember **$S$ and $N$ are fixed for a given root**; changing them effectively requires a **new** dataset layout.
 
-### 8.2 “How large must \(G\) be so the hot union can hold \(U\) distinct keys?” (upper bound sizing)
+### 8.2 “How large must $G$ be so the hot union can hold $U$ distinct keys?” (upper bound sizing)
 
 Need:
 
-\[
+$$
 G \cdot K_{\mathrm{gen}} \gtrsim U
 \quad\Rightarrow\quad
 G \gtrsim \left\lceil \frac{U}{K_{\mathrm{gen}}} \right\rceil
-\]
+$$
 
-**Caution:** large \(G\) increases **RAM** (Bloom per generation-shard, mmap resident set under access), **duplicate-check latency**, and **Bloom budget dilution** per §4.6.
+**Caution:** large $G$ increases **RAM** (Bloom per generation-shard, mmap resident set under access), **duplicate-check latency**, and **Bloom budget dilution** per §4.6.
 
-### 8.3 “How much mmap disk for \(G\) full generations?”
+### 8.3 “How much mmap disk for $G$ full generations?”
 
-\[
+$$
 \mathrm{Disk}_{\mathrm{hot.dat}} \approx G \cdot S \cdot (64 + 32\,N)
-\]
+$$
 
-Add Bloom sidecars using §4–5 with your machine’s RAM budget plugged into \(B_{\mathrm{final}}\).
+Add Bloom sidecars using §4–5 with your machine’s RAM budget plugged into $B_{\mathrm{final}}$.
 
 ---
 
@@ -296,14 +298,14 @@ Add Bloom sidecars using §4–5 with your machine’s RAM budget plugged into \
 
 | Quantity | Default-based value |
 |----------|---------------------|
-| \(S\) | 128 |
-| \(N\) | \(2^{22}\) |
-| \(L\) | 75 |
-| \(G\) | 8 |
-| \(K_{\mathrm{gen}}\) | 402 653 184 |
-| \(K_{\mathrm{hot,max}}\) (bound) | \(\approx 3.22 \times 10^9\) |
-| \(\mathrm{Disk}_{\mathrm{dat}}\) per generation | 16 GiB (exact, binary) |
-| Bloom / `.idx` per generation | \(\approx\) hundreds of MiB (depends on \(B_{\mathrm{final}}\), RAM budget, \(g\)) |
+| $S$ | 128 |
+| $N$ | $2^{22}$ |
+| $L$ | 75 |
+| $G$ | 8 |
+| $K_{\mathrm{gen}}$ | 402 653 184 |
+| $K_{\mathrm{hot,max}}$ (bound) | $\approx 3.22 \times 10^9$ |
+| $\mathrm{Disk}_{\mathrm{dat}}$ per generation | 16 GiB (exact, binary) |
+| Bloom / `.idx` per generation | $\approx$ hundreds of MiB (depends on $B_{\mathrm{final}}$, RAM budget, $g$) |
 
 ---
 
@@ -320,15 +322,122 @@ When `enableWalkJournal` is **true** (default on `HistoryDatabase`):
 
 ## 11. Verification checklist
 
-1. **Choose** \(S\), \(N\), \(L\) → compute \(K_{\mathrm{gen}}\).  
-2. **Choose** \(G\) from required **hot** distinct-key horizon vs. §6.2 heuristic.  
-3. **Compute** \(\mathrm{Disk}_{\mathrm{dat}}\), then **Bloom** \(B_{\mathrm{final}}\) using §4 with your **RAM** and expected **\(g\)**.  
-4. **Check** duplicate-check / lookup latency budget vs. \(G\) and Bloom false positives.  
-5. **Plan** journal / cold storage if “retention” must exceed the hot \(G\)-generation window.
+1. **Choose** $S$, $N$, $L$ → compute $K_{\mathrm{gen}}$.  
+2. **Choose** $G$ from required **hot** distinct-key horizon vs. §6.2 heuristic.  
+3. **Compute** $\mathrm{Disk}_{\mathrm{dat}}$, then **Bloom** $B_{\mathrm{final}}$ using §4 with your **RAM** and expected **$g$**.  
+4. **Check** duplicate-check / lookup latency budget vs. $G$ and Bloom false positives.  
+5. **Plan** journal / cold storage if “retention” must exceed the hot $G$-generation window.
 
 ---
 
-## 12. References in code
+## 12. Examples: 1 TiB disk budget (message counts and wall-clock time)
+
+This section treats **one fixed disk budget** $D$ (here **1 TiB**) for **generation mmap + Bloom sidecars only**—not the walk journal, not OS overhead. The formulas are **independent of `maxRetainedGenerations` ($G$)**: $G$ controls how many generations are **hot for lookup/dedupe**, not how many bytes of generation files you could **store on disk** if you kept every retired folder.
+
+Use **binary** tebibytes unless you explicitly size in decimal:
+
+$$
+1\ \mathrm{TiB} = 2^{40}\ \mathrm{bytes} = 1\,099\,511\,627\,776\ \mathrm{bytes}.
+$$
+
+A **decimal** terabyte $1\ \mathrm{TB}_{10} = 10^{12}$ bytes is about **9.09 % smaller** than 1 TiB; all numeric examples below use **1 TiB**.
+
+### 12.1 Per-generation on-disk bytes (defaults)
+
+With **defaults** $S=128$, $N=2^{22}$, $L=75$, and Bloom per shard at the usual floor **$B_{\mathrm{final}}=2^{24}$** bits (see §4):
+
+$$
+\mathrm{Disk}_{\mathrm{dat}} = 17\,179\,889\,152\ \mathrm{B},\quad
+\mathrm{Disk}_{\mathrm{idx}} = 268\,439\,040\ \mathrm{B},\quad
+\mathrm{Disk}_{\mathrm{gen}} = 17\,448\,328\,192\ \mathrm{B} \approx 16.25\ \mathrm{GiB}.
+$$
+
+(`.dat` is $S \cdot (64 + 32N)$; each `.idx` is $28 + B_{\mathrm{final}}/8$ bytes per §4.5, times $S$.)
+
+### 12.2 How many distinct Message-IDs “fit” in 1 TiB of generation files
+
+Assume every generation you store is filled **up to the load limit** with **pairwise disjoint** keys (no duplicate inserts wasting slots). Then the count of **full-generation equivalents** you can pack into budget $D$ is:
+
+$$
+n(D) = \left\lfloor \frac{D}{\mathrm{Disk}_{\mathrm{gen}}} \right\rfloor .
+$$
+
+The corresponding **upper bound** on distinct stored Message-IDs (after hashing) is:
+
+$$
+M(D) = n(D) \cdot K_{\mathrm{gen}} = n(D) \cdot S \cdot \left\lfloor \frac{N \cdot L}{100} \right\rfloor .
+$$
+
+**Example (defaults, $D = 1\ \mathrm{TiB}$):**
+
+$$
+n(1\ \mathrm{TiB}) = \left\lfloor \frac{1\,099\,511\,627\,776}{17\,448\,328\,192} \right\rfloor = 62,
+$$
+
+$$
+M(1\ \mathrm{TiB}) = 62 \cdot 402\,653\,184 = 24\,964\,497\,408 \approx 2.50 \times 10^{10}\ \mathrm{messages}.
+$$
+
+So **about 25 billion** distinct Message-IDs could be **indexed in slot space** across **62** fully packed default-sized generations that together occupy **just under** 1 TiB of this layout (62 × 16.25 GiB ≈ 1.008 TiB raw file sum before rounding down with $\lfloor\cdot\rfloor$).
+
+**Same idea in decimal $10^{12}$ bytes** (marketing “TB”):
+
+$$
+n(10^{12}) = \left\lfloor \frac{10^{12}}{17\,448\,328\,192} \right\rfloor = 57 \quad\Rightarrow\quad M \approx 2.30 \times 10^{10}.
+$$
+
+### 12.3 “How long” can those messages be stored (wall-clock)
+
+Disk budget answers **how many unique keys you could ever place into that much index file space** if generations fill. **Wall-clock** span depends on how fast **new unique** inserts arrive.
+
+Let $\lambda_{\mathrm{uniq}}$ be the long-run average rate of inserts that consume a **new** slot (successful inserts that are **not** duplicates of something already in the index you care about), in **messages per second**.
+
+A simple **capacity time** (time to exhaust the unique-key budget $M(D)$ at that rate) is:
+
+$$
+T_{\mathrm{cap}}(D,\lambda_{\mathrm{uniq}}) \approx \frac{M(D)}{\lambda_{\mathrm{uniq}}} .
+$$
+
+**Numerical examples (defaults, $D=1\ \mathrm{TiB}$, $M\approx 2.496\times 10^{10}$):**
+
+| $\lambda_{\mathrm{uniq}}$ | $T_{\mathrm{cap}}$ (order of magnitude) |
+|-----------------------------|----------------------------------------|
+| $10^{3}$ / s (1k new IDs/s) | $\approx 2.5\times 10^{7}$ s $\approx$ **290 days** |
+| $10^{4}$ / s | $\approx 2.5\times 10^{6}$ s $\approx$ **29 days** |
+| $10^{5}$ / s | $\approx 2.5\times 10^{5}$ s $\approx$ **2.9 days** |
+| $5\times 10^{4}$ / s | $\approx$ **5.8 days** |
+
+These are **order-of-magnitude schedules to fill the slot budget** implied by 1 TiB of **fully utilized** generations at the stated average **unique** insert rate. They are **not** the same as the **hot retention window** from §6.2, which is governed by $G$ and rollover while the process is running.
+
+### 12.4 Relationship to $G$ (“irrespective of generations” clarified)
+
+- **Disk $D$ and $M(D)$** depend only on layout $(S,N,L)$, Bloom file sizes, and how many generation **folders** you keep on storage. **Increasing $G$ does not change $M(D)$** for a fixed $D$—it changes how many of those bytes stay **mapped and consulted** for `HistoryLookup` / duplicate checks at once.
+- If you **retire** generations but **keep files**, $D$ on the volume can still be large while **logical lookup retention** shrinks because **$G$** bounds the hot set (§6.1).
+- To translate **$T_{\mathrm{cap}}$** into “**Message-IDs remain answerable** for at least …” you must ensure the generation holding a key is **still retained** (or otherwise online), not merely that spare disk exists.
+
+### 12.5 Smaller-table example (same 1 TiB budget, different $N$, $S$)
+
+Suppose you configure **$S=16$**, **$N=2^{16}$**, **$L=75$** (HisBench-style smaller shards):
+
+$$
+\left\lfloor \frac{N\cdot L}{100} \right\rfloor = 49\,152,\quad K_{\mathrm{gen}} = 16 \cdot 49\,152 = 786\,432,
+$$
+
+$$
+\mathrm{Disk}_{\mathrm{dat}} = 16 \cdot (64 + 32\cdot 65\,536) = 33\,554\,432\ \mathrm{bytes}\ (\approx 32\ \mathrm{MiB}).
+$$
+
+Bloom bytes per shard still follow §4 (bits floor to a power of two, **minimum $2^{24}$** bits in code); with small $N$, Bloom files can dominate `.dat`. Call the combined measured or computed $\mathrm{Disk}_{\mathrm{gen}}'$ for your RAM budget and $g$, then reuse:
+
+$$
+n'(D)=\left\lfloor \frac{D}{\mathrm{Disk}_{\mathrm{gen}}'} \right\rfloor,\qquad M'(D)=n'(D)\cdot K_{\mathrm{gen}}.
+$$
+
+For **1 TiB**, $M'$ will be **much larger in generation count** but **each generation holds fewer keys**; the product $M(D)$ moves with your real $\mathrm{Disk}_{\mathrm{gen}}'$ (recompute Bloom using §4 rather than trusting the default-only constant above).
+
+---
+
+## 13. References in code
 
 - Shard geometry: `HistoryDB/HistoryShard.cs` (`HeaderSize`, `EntrySize`, `LoadLimitSlots`, mmap `fileSize`).
 - Generation layout and Bloom sizing: `HistoryDB/ShardedHistoryWriter.cs` (`ComputeBloomBitsPerShard`, `CreateGeneration`, `MinBloomBitsPerShard`, retire path).
