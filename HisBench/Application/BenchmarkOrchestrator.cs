@@ -8,8 +8,11 @@ using System.Globalization;
 
 namespace HisBench.Application;
 
-internal sealed class BenchmarkOrchestrator : IBenchmarkOrchestrator
+internal sealed partial class BenchmarkOrchestrator : IBenchmarkOrchestrator
 {
+    [LoggerMessage(EventId = 4000, Level = LogLevel.Information, Message = "Benchmark canceled.")]
+    private static partial void LogBenchmarkCanceled(ILogger logger);
+
     private readonly IHistoryDatabaseFactory _databaseFactory;
     private readonly IColdRestartCoordinator _coldRestartCoordinator;
     private readonly IProcessTelemetryReader _telemetryReader;
@@ -167,7 +170,7 @@ internal sealed class BenchmarkOrchestrator : IBenchmarkOrchestrator
         }
         catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
         {
-            _logger.LogInformation("Benchmark canceled.");
+            LogBenchmarkCanceled(_logger);
         }
         finally
         {

@@ -13,6 +13,7 @@ using System.Threading.Tasks.Sources;
 
 using HistoryDB.Contracts;
 using HistoryDB.Core.Policies;
+using HistoryDB.Defrag;
 using HistoryDB.Utilities;
 using Microsoft.Extensions.Logging;
 
@@ -106,6 +107,12 @@ internal sealed partial class ShardedHistoryWriter
     private Task? _stopTask;
     private Task? _slotScrubTask;
     private readonly ConcurrentDictionary<(int GenerationId, int ShardId), byte> _bloomRewarmInFlight = new();
+    private readonly ulong _minimumFreeDiskBytes;
+    private readonly ConsecutiveFailureCircuit _bloomPersistCircuit = new(openAfterFailures: 5, cooldownUnbounded: TimeSpan.FromSeconds(30));
+    private readonly object _shutdownFaultsLock = new();
+    private List<Exception>? _shutdownCapturedFaults;
+    private int _directorySizeAccessWarningLogged;
+    private long _lastBloomCircuitSkipLogTicks;
 
     private long _scrubSamplesTotal;
     private long _scrubVolatileMismatches;
@@ -193,6 +200,7 @@ internal sealed partial class ShardedHistoryWriter
         int bloomWarmupLogicalProcessor = -1,
         bool pinSlotScrubberThread = false,
         int slotScrubberLogicalProcessor = -1,
+        ulong minimumFreeDiskBytes = 0,
         ILogger? logger = null)
     {
         _logger = logger ?? TraceFallbackLogger.Instance;
@@ -277,6 +285,7 @@ internal sealed partial class ShardedHistoryWriter
         _slotScrubberLogicalProcessor = pinSlotScrubberThread ? NormalizeLogicalProcessor(slotScrubberLogicalProcessor) : null;
 
         _rootPath = rootPath;
+        _minimumFreeDiskBytes = minimumFreeDiskBytes;
         _shardCount = shardCount;
         _slotsPerShard = slotsPerShard;
         _maxLoadFactorPercent = maxLoadFactorPercent;
@@ -337,6 +346,7 @@ internal sealed partial class ShardedHistoryWriter
             bloomWarmupLogicalProcessor: options.Affinity.BloomWarmupLogicalProcessor,
             pinSlotScrubberThread: options.Affinity.PinSlotScrubberThread,
             slotScrubberLogicalProcessor: options.Affinity.SlotScrubberLogicalProcessor,
+            minimumFreeDiskBytes: options.MinimumFreeDiskBytes,
             logger: logger)
     {
     }
@@ -492,9 +502,35 @@ internal sealed partial class ShardedHistoryWriter
     /// </remarks>
     internal ValueTask<ShardInsertResult> EnqueueAsync(ulong hashHi, ulong hashLo, ulong serverHi, ulong serverLo, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        EnsureStarted();
-        return AwaitBenchResult(EnqueueWithRolloverAsync(hashHi, hashLo, serverHi, serverLo, captureTiming: false, cancellationToken));
+        try
+        {
+            ThrowIfDisposed();
+            EnsureStarted();
+            return AwaitBenchResult(EnqueueWithRolloverAsync(hashHi, hashLo, serverHi, serverLo, captureTiming: false, cancellationToken));
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (IOException ex)
+        {
+            LogEnqueueIoFailed(ex);
+            throw;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            LogEnqueueIoFailed(ex);
+            throw;
+        }
+        catch (ObjectDisposedException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogEnqueueFailedCritical(ex);
+            return ValueTask.FromResult(ShardInsertResult.Full);
+        }
     }
 
     /// <summary>
@@ -518,6 +554,648 @@ internal sealed partial class ShardedHistoryWriter
         return bench.Result;
     }
 
+    /// <summary>Returns the currently-active generation id (the newest retained generation accepting inserts).</summary>
+    internal int ActiveGenerationId
+    {
+        get
+        {
+            lock (_lifecycleLock)
+            {
+                return _activeGenerationId;
+            }
+        }
+    }
+
+    internal bool IsBloomPersistCircuitOpen => _bloomPersistCircuit.IsOpen;
+
+    internal IReadOnlyList<Exception> GetShutdownFaults()
+    {
+        lock (_shutdownFaultsLock)
+        {
+            return _shutdownCapturedFaults is null
+                ? Array.Empty<Exception>()
+                : _shutdownCapturedFaults.ToArray();
+        }
+    }
+
+    /// <summary>Returns a snapshot of retained generation ids in newest-first order.</summary>
+    internal int[] GetRetainedGenerationIdsNewestFirst()
+    {
+        lock (_lifecycleLock)
+        {
+            int[] ids = new int[_generations.Count];
+            for (int i = 0; i < _generations.Count; i++)
+            {
+                ids[i] = _generations[_generations.Count - 1 - i].GenerationId;
+            }
+
+            return ids;
+        }
+    }
+
+    /// <summary>Forces a generation rollover so the previously-active generation becomes a sealed compaction candidate.</summary>
+    internal void ForceGenerationRollover()
+    {
+        ThrowIfDisposed();
+        EnsureStarted();
+        int seenGenerationId;
+        lock (_lifecycleLock)
+        {
+            seenGenerationId = _activeGenerationId;
+        }
+
+        EnsureNextGeneration(seenGenerationId);
+    }
+
+    /// <summary>
+    /// Estimates the fraction of occupied slots in <paramref name="generationId"/> that would be reclaimed by compaction
+    /// (sum of tombstones plus live entries whose hash is in <paramref name="expired"/>, divided by total occupied + tombstoned slots).
+    /// </summary>
+    /// <returns>(fraction, totalSlotsScanned, reclaimableSlotCount).</returns>
+    internal async Task<(double Fraction, long SlotsScanned, long ReclaimableSlots)> EstimateExpiredFractionAsync(
+        int generationId,
+        IReadOnlySet<Hash128> expired,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+
+        GenerationState? gen = null;
+        lock (_lifecycleLock)
+        {
+            for (int i = 0; i < _generations.Count; i++)
+            {
+                if (_generations[i].GenerationId == generationId)
+                {
+                    gen = _generations[i];
+                    break;
+                }
+            }
+        }
+
+        if (gen is null)
+        {
+            return (0.0, 0, 0);
+        }
+
+        long slotsScanned = 0;
+        long reclaimable = 0;
+        long occupiedAndTombstones = 0;
+
+        for (int shardId = 0; shardId < _shardCount; shardId++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            HistoryShard shard = gen.Shards[shardId];
+            ulong tableSize = shard.TableSize;
+            ulong watermark = shard.MaxOccupiedSlotIndex;
+            ulong scanUpper = watermark == 0 ? tableSize : Math.Min(watermark + 1UL, tableSize);
+
+            for (ulong i = 0; i < scanUpper; i++)
+            {
+                if ((i & WarmupYieldMask) == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    await Task.Yield();
+                }
+
+                slotsScanned++;
+                if (shard.IsTombstoneAt(i))
+                {
+                    occupiedAndTombstones++;
+                    reclaimable++;
+                    continue;
+                }
+
+                if (!shard.TryReadHashAt(i, out ulong hi, out ulong lo))
+                {
+                    continue;
+                }
+
+                occupiedAndTombstones++;
+                if (expired.Contains(new Hash128(hi, lo)))
+                {
+                    reclaimable++;
+                }
+            }
+        }
+
+        double fraction = occupiedAndTombstones == 0L
+            ? 0.0
+            : (double)reclaimable / (double)occupiedAndTombstones;
+        return (fraction, slotsScanned, reclaimable);
+    }
+
+    /// <summary>
+    /// Builds a fresh sibling generation directory containing only non-expired non-tombstoned slots from <paramref name="generationId"/>,
+    /// then atomically replaces the source generation with the sibling under <c>_lifecycleLock</c>. The source directory is renamed to
+    /// <c>{token}.compact-old-{ticks:x}/</c> and asynchronously deleted.
+    /// </summary>
+    /// <param name="generationId">Source generation id; must be retained and not currently active.</param>
+    /// <param name="expired">Set of hashes considered expired; matching slots are dropped during the copy.</param>
+    /// <param name="cancellationToken">Cancellation while building the sibling or awaiting source writer drain.</param>
+    /// <returns>The per-generation outcome (compaction success or skip reason).</returns>
+    internal async Task<GenerationDefragOutcome> CompactGenerationAsync(
+        int generationId,
+        IReadOnlySet<Hash128> expired,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        EnsureStarted();
+
+        GenerationState srcGen;
+        int srcIndex;
+        string generationToken = FormatGenerationToken(generationId);
+        string sourceDir = Path.Combine(_rootPath, generationToken);
+        string siblingDir = Path.Combine(_rootPath, $"{generationToken}-defrag-tmp");
+
+        lock (_lifecycleLock)
+        {
+            srcIndex = -1;
+            for (int i = 0; i < _generations.Count; i++)
+            {
+                if (_generations[i].GenerationId == generationId)
+                {
+                    srcIndex = i;
+                    break;
+                }
+            }
+
+            if (srcIndex < 0)
+            {
+                return new GenerationDefragOutcome(generationId, false, 0, 0, 0, 0, 0, "Generation not retained.");
+            }
+
+            if (_activeGenerationId == generationId)
+            {
+                return new GenerationDefragOutcome(generationId, false, 0, 0, 0, 0, 0, "Generation is active.");
+            }
+
+            srcGen = _generations[srcIndex];
+            if (srcGen.IsRetired)
+            {
+                return new GenerationDefragOutcome(generationId, false, 0, 0, 0, 0, 0, "Generation already retired.");
+            }
+        }
+
+        // Step 1: build sibling shards in tmp directory (no lock; concurrent reads of source are safe via mmap).
+        if (Directory.Exists(siblingDir))
+        {
+            try
+            {
+                Directory.Delete(siblingDir, recursive: true);
+            }
+            catch (Exception ex)
+            {
+                LogCompactSiblingPrepareFailed(ex, generationId, siblingDir);
+                return new GenerationDefragOutcome(generationId, false, 0, 0, 0, 0, 0, "Could not clear stale sibling directory.");
+            }
+        }
+
+        if (_minimumFreeDiskBytes > 0 &&
+            DiskSpaceGuard.TryGetAvailableBytes(_rootPath, out long freeBytes) &&
+            freeBytes < (long)_minimumFreeDiskBytes)
+        {
+            LogCompactSkippedLowDisk(generationId, freeBytes, _minimumFreeDiskBytes);
+            return new GenerationDefragOutcome(generationId, false, 0, 0, 0, 0, 0, "DiskSpace: insufficient free bytes for compaction.");
+        }
+
+        Directory.CreateDirectory(siblingDir);
+
+        int bloomBitsPerShard;
+        lock (_lifecycleLock)
+        {
+            bloomBitsPerShard = ComputeBloomBitsPerShard(_generations.Count);
+        }
+
+        long totalSlotsScanned = 0;
+        long survivors = 0;
+        long expiredDropped = 0;
+        long tombstonesDropped = 0;
+
+        try
+        {
+            for (int shardId = 0; shardId < _shardCount; shardId++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                string shardToken = FormatShardSequenceToken(shardId);
+                string siblingShardPath = Path.Combine(siblingDir, $"{shardToken}.dat");
+                string siblingBloomPath = Path.Combine(siblingDir, $"{shardToken}.idx");
+
+                BloomFilter64 newBloom = new(bloomBitsPerShard, BloomHashFunctions);
+
+                HistoryShard srcShard = srcGen.Shards[shardId];
+                ulong tableSize = srcShard.TableSize;
+                ulong watermark = srcShard.MaxOccupiedSlotIndex;
+                ulong scanUpper = watermark == 0UL ? tableSize : Math.Min(watermark + 1UL, tableSize);
+
+                ulong siblingUsedSlots = 0;
+                using (HistoryShard sibling = new(siblingShardPath, _slotsPerShard, _maxLoadFactorPercent))
+                {
+                    for (ulong i = 0; i < scanUpper; i++)
+                    {
+                        if ((i & WarmupYieldMask) == 0)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            await Task.Yield();
+                        }
+
+                        totalSlotsScanned++;
+
+                        if (!srcShard.TryReadOccupiedSlotAt(
+                                i,
+                                out ulong hashHi,
+                                out ulong hashLo,
+                                out ulong serverHi,
+                                out ulong serverLo,
+                                out long obt,
+                                out long acc,
+                                out ulong ctr))
+                        {
+                            if (srcShard.IsTombstoneAt(i))
+                            {
+                                tombstonesDropped++;
+                            }
+                            continue;
+                        }
+
+                        if (expired.Contains(new Hash128(hashHi, hashLo)))
+                        {
+                            expiredDropped++;
+                            continue;
+                        }
+
+                        PreservedSlotAccess preserved = new(obt, acc, ctr);
+                        ShardInsertResult ir = sibling.TryExistsOrInsertUncheckedInternal(
+                            hashHi,
+                            hashLo,
+                            serverHi,
+                            serverLo,
+                            out _,
+                            preserveAccessMetadata: preserved);
+                        if (ir == ShardInsertResult.Inserted)
+                        {
+                            siblingUsedSlots++;
+                            newBloom.Add(hashHi, hashLo);
+                            survivors++;
+                        }
+                        // Duplicate / Full / ProbeLimitExceeded should be impossible on a sibling sized identically to the source
+                        // when copying a strict subset of unique hashes; we simply skip those slots.
+                    }
+
+                    sibling.FlushUsedSlots(siblingUsedSlots);
+                }
+
+                BloomFilter64.SaveToFile(siblingBloomPath, newBloom);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            TryDeleteSiblingDirectory(siblingDir, generationId);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogCompactBuildFailed(ex, generationId);
+            TryDeleteSiblingDirectory(siblingDir, generationId);
+            return new GenerationDefragOutcome(generationId, false, totalSlotsScanned, survivors, expiredDropped, tombstonesDropped, 0, "Failed to build compacted sibling: " + ex.Message);
+        }
+
+        // Step 2: retire source generation (drain channels, await writers, dispose shards).
+        Task[] writerTasks;
+        lock (_lifecycleLock)
+        {
+            if (srcIndex >= _generations.Count || _generations[srcIndex].GenerationId != generationId)
+            {
+                TryDeleteSiblingDirectory(siblingDir, generationId);
+                return new GenerationDefragOutcome(generationId, false, totalSlotsScanned, survivors, expiredDropped, tombstonesDropped, 0, "Generation moved during compaction.");
+            }
+
+            srcGen.IsRetired = true;
+            for (int s = 0; s < _shardCount; s++)
+            {
+                srcGen.Queues[s].Writer.TryComplete();
+            }
+
+            writerTasks = (Task[])srcGen.WriterTasks.Clone();
+        }
+
+        try
+        {
+            await Task.WhenAll(writerTasks).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal during shutdown.
+        }
+        catch (Exception ex)
+        {
+            LogCompactDrainFailed(ex, generationId);
+        }
+
+        // Step 3: atomic swap under _lifecycleLock. Disposes source mmaps, renames directories, opens new generation, replaces in-list.
+        long bytesReclaimed = 0;
+        string oldRetiredPath;
+        GenerationState newGen;
+        lock (_lifecycleLock)
+        {
+            if (srcIndex >= _generations.Count || _generations[srcIndex].GenerationId != generationId)
+            {
+                TryDeleteSiblingDirectory(siblingDir, generationId);
+                return new GenerationDefragOutcome(generationId, false, totalSlotsScanned, survivors, expiredDropped, tombstonesDropped, 0, "Generation list mutated during compaction swap.");
+            }
+
+            for (int s = 0; s < _shardCount; s++)
+            {
+                try
+                {
+                    srcGen.Shards[s].Dispose();
+                }
+                catch (Exception ex)
+                {
+                    LogShardDisposeFailedDuringRetire(ex, generationId, s);
+                }
+            }
+
+            long ticks = DateTime.UtcNow.Ticks;
+            oldRetiredPath = Path.Combine(_rootPath, $"{generationToken}.compact-old-{ticks:x}");
+
+            try
+            {
+                Directory.Move(sourceDir, oldRetiredPath);
+                Directory.Move(siblingDir, sourceDir);
+            }
+            catch (Exception ex)
+            {
+                LogCompactSwapFailed(ex, generationId);
+                return new GenerationDefragOutcome(generationId, false, totalSlotsScanned, survivors, expiredDropped, tombstonesDropped, 0, "Atomic directory swap failed: " + ex.Message);
+            }
+
+            try
+            {
+                bytesReclaimed = TryComputeDirectorySizeBytes(oldRetiredPath) - TryComputeDirectorySizeBytes(sourceDir);
+                if (bytesReclaimed < 0)
+                {
+                    bytesReclaimed = 0;
+                }
+            }
+            catch
+            {
+                bytesReclaimed = 0;
+            }
+
+            try
+            {
+                newGen = OpenExistingGeneration_NoLock(generationId);
+            }
+            catch (Exception ex)
+            {
+                LogCompactReopenFailed(ex, generationId);
+                return new GenerationDefragOutcome(generationId, false, totalSlotsScanned, survivors, expiredDropped, tombstonesDropped, 0, "Failed to re-open compacted generation: " + ex.Message);
+            }
+
+            _generations[srcIndex] = newGen;
+        }
+
+        // Step 4: schedule async deletion of the renamed source directory.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                Directory.Delete(oldRetiredPath, recursive: true);
+            }
+            catch (Exception ex)
+            {
+                LogCompactRetiredCleanupFailed(ex, oldRetiredPath);
+            }
+        });
+
+        LogCompactCompleted(generationId, totalSlotsScanned, survivors, expiredDropped, tombstonesDropped, bytesReclaimed);
+        return new GenerationDefragOutcome(generationId, true, totalSlotsScanned, survivors, expiredDropped, tombstonesDropped, bytesReclaimed, null);
+    }
+
+    private void TryDeleteSiblingDirectory(string siblingDir, int generationId)
+    {
+        try
+        {
+            if (Directory.Exists(siblingDir))
+            {
+                Directory.Delete(siblingDir, recursive: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogCompactSiblingCleanupFailed(ex, generationId, siblingDir);
+        }
+    }
+
+    private long TryComputeDirectorySizeBytes(string path)
+    {
+        if (!Directory.Exists(path))
+        {
+            return 0;
+        }
+
+        long total = 0;
+        try
+        {
+            foreach (string file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    total += new FileInfo(file).Length;
+                }
+                catch
+                {
+                    // Best-effort; ignore per-file failures.
+                }
+            }
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            LogDirectorySizeProbeAccessDeniedIfFirst(path, ex.Message);
+        }
+        catch (IOException ex)
+        {
+            LogDirectorySizeProbeAccessDeniedIfFirst(path, ex.Message);
+        }
+
+        return total;
+    }
+
+    private void LogDirectorySizeProbeAccessDeniedIfFirst(string path, string message)
+    {
+        if (Interlocked.Exchange(ref _directorySizeAccessWarningLogged, 1) != 0)
+        {
+            return;
+        }
+
+        LogDirectorySizeProbeAccessDenied(path, message);
+    }
+
+    private GenerationState OpenExistingGeneration_NoLock(int generationId)
+    {
+        string generationToken = FormatGenerationToken(generationId);
+        string generationRoot = Path.Combine(_rootPath, generationToken);
+
+        StartBloomPersistLoopIfNeeded_NoLock();
+
+        int bloomBitsPerShard = ComputeBloomBitsPerShard(nextGenerationCount: _generations.Count + 1);
+        HistoryShard[] shards = new HistoryShard[_shardCount];
+        Channel<ShardWriteRequest>[] queues = new Channel<ShardWriteRequest>[_shardCount];
+        Task[] writerTasks = new Task[_shardCount];
+        long[] fullInsertFailures = new long[_shardCount];
+        long[] probeLimitFailures = new long[_shardCount];
+        long[] pendingWriteApprox = new long[_shardCount];
+        BloomFilter64[] bloomFilters = new BloomFilter64[_shardCount];
+        string[] bloomPaths = new string[_shardCount];
+        bool[] bloomShardTrusted = new bool[_shardCount];
+
+        for (int shardId = 0; shardId < _shardCount; shardId++)
+        {
+            string shardToken = FormatShardSequenceToken(shardId);
+            string shardPath = Path.Combine(generationRoot, $"{shardToken}.dat");
+            string bloomPath = Path.Combine(generationRoot, $"{shardToken}.idx");
+
+            shards[shardId] = new HistoryShard(shardPath, _slotsPerShard, _maxLoadFactorPercent);
+            queues[shardId] = Channel.CreateBounded<ShardWriteRequest>(
+                new BoundedChannelOptions(_queueCapacityPerShard)
+                {
+                    SingleReader = true,
+                    SingleWriter = false,
+                    AllowSynchronousContinuations = false,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
+            bloomPaths[shardId] = bloomPath;
+            string bloomDiagTag = $"generation {generationToken}, shard-{shardToken}";
+            bloomFilters[shardId] = BloomFilter64.TryLoadFromFile(
+                    bloomPath,
+                    bloomBitsPerShard,
+                    BloomHashFunctions,
+                    bloomDiagTag,
+                    _logger,
+                    out BloomFilter64? loadedFilter)
+                ? loadedFilter!
+                : new BloomFilter64(bloomBitsPerShard, BloomHashFunctions);
+            bloomShardTrusted[shardId] = loadedFilter is not null;
+        }
+
+        GenerationState generation = new(
+            generationId,
+            shards,
+            queues,
+            writerTasks,
+            fullInsertFailures,
+            probeLimitFailures,
+            pendingWriteApprox,
+            bloomFilters,
+            bloomPaths,
+            bloomShardTrusted);
+        for (int shardId = 0; shardId < _shardCount; shardId++)
+        {
+            int capturedShardId = shardId;
+            writerTasks[shardId] = Task.Run(() => RunShardWriterAsync(generation, capturedShardId, _stopCts.Token), _stopCts.Token);
+        }
+
+        StartBloomWarmupIfNeeded(generation);
+
+        return generation;
+    }
+
+    /// <summary>
+    /// Broadcasts a tombstone request to the matching shard channel of every retained generation (newest-first), awaiting all
+    /// completions and returning the count of successful tombstones across generations.
+    /// </summary>
+    /// <param name="hashHi">High 64 bits of the content hash being tombstoned.</param>
+    /// <param name="hashLo">Low 64 bits of the content hash being tombstoned.</param>
+    /// <param name="cancellationToken">Cancellation while awaiting channel back-pressure or per-shard completion.</param>
+    /// <returns>The number of generations in which a matching slot was found and overwritten with the tombstone sentinel.</returns>
+    /// <remarks>
+    /// <para>
+    /// <b>Best-effort:</b> Callers typically discard the returned task because <c>HistoryExpire</c> already records the hash in
+    /// the in-memory expired filter, which is the authoritative read path. Tombstoning the on-disk slots is purely for physical
+    /// reclamation by the defrag engine; per-shard failures are logged but not surfaced as exceptions.
+    /// </para>
+    /// </remarks>
+    internal async ValueTask<int> EnqueueTombstoneAcrossGenerationsAsync(ulong hashHi, ulong hashLo, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        EnsureStarted();
+
+        GenerationState[] generations = GetGenerationsSnapshotNewestFirst();
+        if (generations.Length == 0)
+        {
+            return 0;
+        }
+
+        int shardId = GetShardId(hashLo);
+        List<(ShardCompletionSource Completion, ValueTask<ShardInsertResult> Pending)> awaiting = new(generations.Length);
+
+        try
+        {
+            for (int i = 0; i < generations.Length; i++)
+            {
+                GenerationState generation = generations[i];
+                ShardCompletionSource completion = RentCompletion();
+                completion.Reset();
+                ValueTask<ShardInsertResult> pending = completion.AsValueTask();
+                ShardWriteRequest request = new(ShardWriteOp.Tombstone, hashHi, hashLo, 0, 0, completion, null);
+
+                bool enqueued;
+                try
+                {
+                    Interlocked.Increment(ref generation.PendingWriteApprox[shardId]);
+                    enqueued = generation.Queues[shardId].Writer.TryWrite(request);
+                    if (!enqueued)
+                    {
+                        await generation.Queues[shardId].Writer.WriteAsync(request, cancellationToken).ConfigureAwait(false);
+                        enqueued = true;
+                    }
+                }
+                catch
+                {
+                    Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
+                    ReturnCompletion(completion, reset: false);
+                    throw;
+                }
+
+                awaiting.Add((completion, pending));
+            }
+
+            int tombstoned = 0;
+            for (int i = 0; i < awaiting.Count; i++)
+            {
+                ShardInsertResult mapped;
+                try
+                {
+                    mapped = await awaiting[i].Pending.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                    // Per-generation failures are tolerated -- HistoryExpire already updated _expired which dominates Exists semantics.
+                    continue;
+                }
+
+                if (mapped == ShardInsertResult.Inserted)
+                {
+                    tombstoned++;
+                }
+            }
+
+            return tombstoned;
+        }
+        finally
+        {
+            for (int i = 0; i < awaiting.Count; i++)
+            {
+                ReturnCompletion(awaiting[i].Completion, reset: false);
+            }
+        }
+    }
+
     /// <summary>
     /// Tests whether a hash is present in any retained generation, consulting Bloom filters when trusted.
     /// </summary>
@@ -528,28 +1206,134 @@ internal sealed partial class ShardedHistoryWriter
     /// <para>
     /// <b>Thread safety:</b> Safe concurrent with writers; reads do not take the lifecycle lock across shard probes.
     /// </para>
-    /// <para>
-    /// <b>Errors:</b> Storage or fatal conditions propagate to the caller (for example <see cref="ObjectDisposedException"/>,
-    /// <see cref="InvalidDataException"/>, <see cref="IOException"/>).
-    /// </para>
     /// </remarks>
     internal bool Exists(ulong hashHi, ulong hashLo)
     {
-        ThrowIfDisposed();
-        EnsureStarted();
+        try
+        {
+            ThrowIfDisposed();
+            EnsureStarted();
+
+            int shardId = GetShardId(hashLo);
+            foreach (GenerationState generation in GetGenerationsSnapshotNewestFirst())
+            {
+                if (generation.BloomShardTrusted[shardId] && !generation.BloomFilters[shardId].MayContain(hashHi, hashLo))
+                {
+                    continue;
+                }
+
+                if (generation.Shards[shardId].Exists(hashHi, hashLo))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        catch (IOException ex)
+        {
+            LogExistsIoFailed(ex);
+            throw;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            LogExistsIoFailed(ex);
+            throw;
+        }
+        catch (ObjectDisposedException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogExistsUnexpectedException(ex);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// When the hash exists in a retained generation (Bloom + shard read path), enqueues a writer-only touch that refreshes
+    /// <c>date_accessed</c> and increments <c>accessed_counter</c> on the matching slot. Returns <see langword="false"/> when absent.
+    /// </summary>
+    internal async ValueTask<bool> ExistsAndRecordAccessAsync(
+        ulong hashHi,
+        ulong hashLo,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            ThrowIfDisposed();
+            EnsureStarted();
 
         int shardId = GetShardId(hashLo);
         foreach (GenerationState generation in GetGenerationsSnapshotNewestFirst())
         {
             if (generation.BloomShardTrusted[shardId] && !generation.BloomFilters[shardId].MayContain(hashHi, hashLo))
             {
-                continue;
+                if (generation.BloomShardTrusted[shardId] && !generation.BloomFilters[shardId].MayContain(hashHi, hashLo))
+                {
+                    continue;
+                }
+
+                if (!generation.Shards[shardId].Exists(hashHi, hashLo))
+                {
+                    continue;
+                }
+
+                ShardCompletionSource completion = RentCompletion();
+                try
+                {
+                    completion.Reset();
+                    ValueTask<ShardInsertResult> pending = completion.AsValueTask();
+                    ShardWriteRequest request = new(ShardWriteOp.RecordAccess, hashHi, hashLo, 0, 0, completion, null);
+                    Interlocked.Increment(ref generation.PendingWriteApprox[shardId]);
+                    try
+                    {
+                        bool enqueued = generation.Queues[shardId].Writer.TryWrite(request);
+                        if (!enqueued)
+                        {
+                            await generation.Queues[shardId].Writer.WriteAsync(request, cancellationToken).ConfigureAwait(false);
+                        }
+                    }
+                    catch
+                    {
+                        Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
+                        throw;
+                    }
+
+                    _ = await pending.ConfigureAwait(false);
+                    return true;
+                }
+                finally
+                {
+                    ReturnCompletion(completion, reset: false);
+                }
             }
 
-            if (generation.Shards[shardId].Exists(hashHi, hashLo))
-            {
-                return true;
-            }
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (IOException ex)
+        {
+            LogExistsIoFailed(ex);
+            throw;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            LogExistsIoFailed(ex);
+            throw;
+        }
+        catch (ObjectDisposedException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogExistsUnexpectedException(ex);
+            return false;
         }
 
         return false;
@@ -579,7 +1363,7 @@ internal sealed partial class ShardedHistoryWriter
             {
                 completion.Reset();
                 ValueTask<ShardInsertResult> pending = completion.AsValueTask();
-                ShardWriteRequest request = new(hashHi, hashLo, serverHi, serverLo, completion, null);
+                ShardWriteRequest request = new(ShardWriteOp.Insert, hashHi, hashLo, serverHi, serverLo, completion, null);
 
                 try
                 {
@@ -674,26 +1458,26 @@ internal sealed partial class ShardedHistoryWriter
             }
         }
 
+        List<Task> allTasks = [];
+        foreach (GenerationState generation in generations)
+        {
+            if (generation.WarmupTask is not null)
+            {
+                allTasks.Add(generation.WarmupTask);
+            }
+
+            allTasks.AddRange(generation.WriterTasks);
+        }
+
+        allTasks.AddRange(retiredCleanupTasks);
+
+        if (_slotScrubTask is not null)
+        {
+            allTasks.Add(_slotScrubTask);
+        }
+
         try
         {
-            List<Task> allTasks = [];
-            foreach (GenerationState generation in generations)
-            {
-                if (generation.WarmupTask is not null)
-                {
-                    allTasks.Add(generation.WarmupTask);
-                }
-
-                allTasks.AddRange(generation.WriterTasks);
-            }
-
-            allTasks.AddRange(retiredCleanupTasks);
-
-            if (_slotScrubTask is not null)
-            {
-                allTasks.Add(_slotScrubTask);
-            }
-
             await Task.WhenAll(allTasks).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -703,6 +1487,10 @@ internal sealed partial class ShardedHistoryWriter
         catch (Exception ex)
         {
             LogShutdownWaitFailed(ex);
+        }
+        finally
+        {
+            CaptureShutdownWriterFaults(allTasks);
         }
 
         await CompleteBloomPersistAsync().ConfigureAwait(false);
@@ -731,6 +1519,34 @@ internal sealed partial class ShardedHistoryWriter
         LogStopped();
     }
 
+    private void CaptureShutdownWriterFaults(List<Task> tasks)
+    {
+        List<Exception>? faults = null;
+        for (int i = 0; i < tasks.Count; i++)
+        {
+            Task t = tasks[i];
+            if (!t.IsFaulted || t.Exception is null)
+            {
+                continue;
+            }
+
+            foreach (Exception ex in t.Exception.Flatten().InnerExceptions)
+            {
+                faults ??= new List<Exception>();
+                faults.Add(ex);
+                LogShutdownWriterTaskFaulted(i, ex);
+            }
+        }
+
+        if (faults is not null)
+        {
+            lock (_shutdownFaultsLock)
+            {
+                _shutdownCapturedFaults = faults;
+            }
+        }
+    }
+
     private async Task RunShardWriterAsync(GenerationState generation, int shardId, CancellationToken stoppingToken)
     {
         TryApplyShardWriterAffinity(shardId);
@@ -753,21 +1569,90 @@ internal sealed partial class ShardedHistoryWriter
                         queueWaitTicks = dequeuedTicks - writeStartTicks;
                     }
 
+                    if (request.Op == ShardWriteOp.RecordAccess)
+                    {
+                        long raExecStart = Stopwatch.GetTimestamp();
+                        ShardAccessRecordResult ar = shard.TryRecordAccessOnMatch(request.HashHi, request.HashLo);
+                        long raExecEnd = Stopwatch.GetTimestamp();
+                        if (request.ChannelWriteStartTicks is not null)
+                        {
+                            request.Completion?.SetBenchTiming(queueWaitTicks, raExecEnd - raExecStart);
+                        }
+
+                        ShardInsertResult mapped = ar switch
+                        {
+                            ShardAccessRecordResult.Recorded => ShardInsertResult.AccessRecorded,
+                            ShardAccessRecordResult.NotFound => ShardInsertResult.AccessNotFound,
+                            ShardAccessRecordResult.RaceLost => ShardInsertResult.AccessSkipped,
+                            ShardAccessRecordResult.ProbeLimitExceeded => ShardInsertResult.AccessSkipped,
+                            _ => ShardInsertResult.AccessNotFound,
+                        };
+                        request.Completion?.SetResult(mapped);
+                        continue;
+                    }
+
+                    if (request.Op == ShardWriteOp.Tombstone)
+                    {
+                        long tsExecStart = Stopwatch.GetTimestamp();
+                        ShardTombstoneResult tsResult = shard.TryTombstone(request.HashHi, request.HashLo);
+                        long tsExecEnd = Stopwatch.GetTimestamp();
+                        if (request.ChannelWriteStartTicks is not null)
+                        {
+                            request.Completion?.SetBenchTiming(queueWaitTicks, tsExecEnd - tsExecStart);
+                        }
+
+                        if (tsResult == ShardTombstoneResult.Tombstoned)
+                        {
+                            if (localUsedSlots > 0)
+                            {
+                                localUsedSlots--;
+                            }
+
+                            if ((localUsedSlots & UsedSlotsFlushMask) == 0)
+                            {
+                                shard.FlushUsedSlots(localUsedSlots);
+                            }
+                        }
+
+                        // Map tombstone outcome onto the shared insert result enum so callers awaiting the completion can react:
+                        //   Tombstoned -> Inserted (action took effect)
+                        //   NotFound   -> Duplicate (no-op; the hash was not in this shard/generation)
+                        //   ProbeLimit -> ProbeLimitExceeded (same)
+                        ShardInsertResult mapped = tsResult switch
+                        {
+                            ShardTombstoneResult.Tombstoned => ShardInsertResult.Inserted,
+                            ShardTombstoneResult.ProbeLimitExceeded => ShardInsertResult.ProbeLimitExceeded,
+                            _ => ShardInsertResult.Duplicate,
+                        };
+                        request.Completion?.SetResult(mapped);
+                        continue;
+                    }
+
                     long execStartTicks = Stopwatch.GetTimestamp();
-                    ShardInsertResult result = localUsedSlots >= shard.LoadLimitSlots
-                        ? ShardInsertResult.Full
-                        : shard.TryExistsOrInsertUnchecked(request.HashHi, request.HashLo, request.ServerHi, request.ServerLo);
+                    bool reclaimedTombstone = false;
+                    ShardInsertResult result;
+                    if (localUsedSlots >= shard.LoadLimitSlots)
+                    {
+                        result = ShardInsertResult.Full;
+                    }
+                    else
+                    {
+                        result = shard.TryExistsOrInsertUncheckedInternal(request.HashHi, request.HashLo, request.ServerHi, request.ServerLo, out reclaimedTombstone);
+                    }
                     long execEndTicks = Stopwatch.GetTimestamp();
                     if (request.ChannelWriteStartTicks is not null)
                     {
-                        request.Completion.SetBenchTiming(queueWaitTicks, execEndTicks - execStartTicks);
+                        request.Completion?.SetBenchTiming(queueWaitTicks, execEndTicks - execStartTicks);
                     }
 
                     if (result == ShardInsertResult.Inserted)
                     {
                         generation.BloomFilters[shardId].Add(request.HashHi, request.HashLo);
                         generation.BloomShardTrusted[shardId] = true;
-                        localUsedSlots++;
+                        if (!reclaimedTombstone)
+                        {
+                            localUsedSlots++;
+                        }
                         MaybeProactiveRolloverFromUsedSlots(generation, localUsedSlots);
                         if ((localUsedSlots & UsedSlotsFlushMask) == 0)
                         {
@@ -784,14 +1669,14 @@ internal sealed partial class ShardedHistoryWriter
                             }
                         }
 
-                        request.Completion.SetResult(ShardInsertResult.Inserted);
+                        request.Completion?.SetResult(ShardInsertResult.Inserted);
                         continue;
                     }
 
                     if (result == ShardInsertResult.Full)
                     {
                         Interlocked.Increment(ref generation.FullInsertFailures[shardId]);
-                        request.Completion.SetResult(ShardInsertResult.Full);
+                        request.Completion?.SetResult(ShardInsertResult.Full);
                         continue;
                     }
 
@@ -799,11 +1684,11 @@ internal sealed partial class ShardedHistoryWriter
                     {
                         Interlocked.Increment(ref generation.ProbeLimitFailures[shardId]);
                         MaybeProactiveRolloverFromAggregateProbeFailures(generation);
-                        request.Completion.SetResult(ShardInsertResult.ProbeLimitExceeded);
+                        request.Completion?.SetResult(ShardInsertResult.ProbeLimitExceeded);
                         continue;
                     }
 
-                    request.Completion.SetResult(result);
+                    request.Completion?.SetResult(result);
                 }
 
                 MaybeProactiveRolloverFromQueueDepth(generation, shardId);
@@ -1166,6 +2051,10 @@ internal sealed partial class ShardedHistoryWriter
         _activeGenerationId = generationId;
         LogGenerationActivated(generationId);
 
+        // Sweep finished retire tasks so the list does not grow unbounded over the lifetime of a long-running process.
+        // Each retired task captures a GenerationState (shard arrays, queues, blooms) via closure; pruning lets the GC reclaim it.
+        PruneCompletedRetiredCleanupTasks_NoLock();
+
         while (_generations.Count > _maxRetainedGenerations)
         {
             GenerationState retired = _generations[0];
@@ -1193,6 +2082,36 @@ internal sealed partial class ShardedHistoryWriter
         if (write < tasks.Count)
         {
             tasks.RemoveRange(write, tasks.Count - write);
+        }
+    }
+
+    private void PruneCompletedRetiredCleanupTasks_NoLock()
+    {
+        if (_retiredGenerationCleanupTasks.Count == 0)
+        {
+            return;
+        }
+
+        int writeIndex = 0;
+        for (int readIndex = 0; readIndex < _retiredGenerationCleanupTasks.Count; readIndex++)
+        {
+            Task task = _retiredGenerationCleanupTasks[readIndex];
+            if (task.IsCompleted)
+            {
+                continue;
+            }
+
+            if (writeIndex != readIndex)
+            {
+                _retiredGenerationCleanupTasks[writeIndex] = task;
+            }
+
+            writeIndex++;
+        }
+
+        if (writeIndex < _retiredGenerationCleanupTasks.Count)
+        {
+            _retiredGenerationCleanupTasks.RemoveRange(writeIndex, _retiredGenerationCleanupTasks.Count - writeIndex);
         }
     }
 
@@ -1319,6 +2238,63 @@ internal sealed partial class ShardedHistoryWriter
         }
     }
 
+    /// <summary>
+    /// Enumerates published occupied slots (non-tombstone) across all retained generations, bounded by each shard's
+    /// <see cref="HistoryShard.MaxOccupiedSlotIndex"/> watermark. Intended for control-plane tools (for example bulk expire).
+    /// </summary>
+    internal async IAsyncEnumerable<StoredArticleMetadata> EnumerateStoredArticleMetadataAsync(
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        EnsureStarted();
+
+        const ulong YieldMask = 0xFFFFUL;
+        GenerationState[] generations = GetGenerationsSnapshotNewestFirst();
+        foreach (GenerationState generation in generations)
+        {
+            for (int shardId = 0; shardId < _shardCount; shardId++)
+            {
+                HistoryShard shard = generation.Shards[shardId];
+                ulong tableSize = shard.TableSize;
+                ulong watermarkExclusive = shard.MaxOccupiedSlotIndex + 1UL;
+                ulong scanUpperExclusive = watermarkExclusive == 0UL || watermarkExclusive > tableSize
+                    ? tableSize
+                    : watermarkExclusive;
+
+                for (ulong i = 0UL; i < scanUpperExclusive; i++)
+                {
+                    if ((i & YieldMask) == 0UL)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        await Task.Yield();
+                    }
+
+                    if (!shard.TryReadOccupiedSlotAt(
+                            i,
+                            out ulong hi,
+                            out ulong lo,
+                            out _,
+                            out _,
+                            out long obt,
+                            out long acc,
+                            out ulong ctr))
+                    {
+                        continue;
+                    }
+
+                    yield return new StoredArticleMetadata(
+                        generation.GenerationId,
+                        shardId,
+                        i,
+                        new Hash128(hi, lo),
+                        obt,
+                        acc,
+                        ctr);
+                }
+            }
+        }
+    }
+
     private int GetShardId(ulong hashLo) => (int)(hashLo % (ulong)_shardCount);
 
     private static void DrainPendingRequestsAsCanceled(ChannelReader<ShardWriteRequest> reader, GenerationState generation, int shardId, CancellationToken cancellationToken)
@@ -1326,7 +2302,7 @@ internal sealed partial class ShardedHistoryWriter
         while (reader.TryRead(out ShardWriteRequest pending))
         {
             Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
-            pending.Completion.SetCanceled(cancellationToken);
+            pending.Completion?.SetCanceled(cancellationToken);
         }
     }
 
@@ -1335,7 +2311,7 @@ internal sealed partial class ShardedHistoryWriter
         while (reader.TryRead(out ShardWriteRequest pending))
         {
             Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
-            pending.Completion.SetException(exception);
+            pending.Completion?.SetException(exception);
         }
     }
 
@@ -1371,7 +2347,7 @@ internal sealed partial class ShardedHistoryWriter
                 {
                     HistoryShard shard = generation.Shards[shardId];
                     shard.FlushUsedSlots(shard.UsedSlots);
-                    shard.WriteSlotRegionCrc32AndFlushView();
+                    shard.FlushMappedViewToDisk();
                 }
 
                 PersistGenerationBlooms(generation);
@@ -1515,12 +2491,19 @@ internal sealed partial class ShardedHistoryWriter
             {
                 while (reader.TryRead(out BloomPersistWork work))
                 {
+                    if (ShouldSkipBloomIoForLowDisk(work.Path))
+                    {
+                        continue;
+                    }
+
                     try
                     {
                         BloomFilter64.SaveWordsToFile(work.Path, work.Words, work.BitCount, work.HashCount);
+                        _bloomPersistCircuit.RecordSuccess();
                     }
                     catch (Exception ex)
                     {
+                        _bloomPersistCircuit.RecordFailure();
                         LogBloomCheckpointWriteFailed(ex, work.Path);
                     }
                 }
@@ -1530,12 +2513,19 @@ internal sealed partial class ShardedHistoryWriter
         {
             while (reader.TryRead(out BloomPersistWork work))
             {
+                if (ShouldSkipBloomIoForLowDisk(work.Path))
+                {
+                    continue;
+                }
+
                 try
                 {
                     BloomFilter64.SaveWordsToFile(work.Path, work.Words, work.BitCount, work.HashCount);
+                    _bloomPersistCircuit.RecordSuccess();
                 }
                 catch (Exception ex)
                 {
+                    _bloomPersistCircuit.RecordFailure();
                     LogBloomCheckpointWriteFailed(ex, work.Path);
                 }
             }
@@ -1550,6 +2540,12 @@ internal sealed partial class ShardedHistoryWriter
             return;
         }
 
+        if (_bloomPersistCircuit.IsOpen && !_bloomPersistCircuit.TryEnterRetry())
+        {
+            MaybeLogBloomPersistSkippedCircuit();
+            return;
+        }
+
         ulong[]? words = filter.TrySnapshotWordsForPersist(_bloomCheckpointMaxSnapshotBytes);
         if (words is null)
         {
@@ -1559,10 +2555,60 @@ internal sealed partial class ShardedHistoryWriter
             return;
         }
 
-        if (!writer.TryWrite(new BloomPersistWork(path, words, filter.BitCount, filter.HashFunctionCount)))
+        if (writer.TryWrite(new BloomPersistWork(path, words, filter.BitCount, filter.HashFunctionCount)))
         {
-            LogBloomCheckpointChannelFullRejectingNew(path);
+            return;
         }
+
+        if (ShouldSkipBloomIoForLowDisk(path))
+        {
+            return;
+        }
+
+        try
+        {
+            BloomFilter64.SaveWordsToFile(path, words, filter.BitCount, filter.HashFunctionCount);
+            _bloomPersistCircuit.RecordSuccess();
+            LogBloomCheckpointSyncFallback(path);
+        }
+        catch (Exception ex)
+        {
+            _bloomPersistCircuit.RecordFailure();
+            LogBloomCheckpointWriteFailed(ex, path);
+        }
+    }
+
+    private bool ShouldSkipBloomIoForLowDisk(string path)
+    {
+        if (_minimumFreeDiskBytes == 0)
+        {
+            return false;
+        }
+
+        if (!DiskSpaceGuard.TryGetAvailableBytes(path, out long avail))
+        {
+            return false;
+        }
+
+        if (avail < (long)_minimumFreeDiskBytes)
+        {
+            LogBloomCheckpointSkippedLowDisk(path, avail, _minimumFreeDiskBytes);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void MaybeLogBloomPersistSkippedCircuit()
+    {
+        long now = Environment.TickCount64;
+        if (now - Volatile.Read(ref _lastBloomCircuitSkipLogTicks) < 30_000)
+        {
+            return;
+        }
+
+        Volatile.Write(ref _lastBloomCircuitSkipLogTicks, now);
+        LogBloomPersistSkippedOpenCircuit();
     }
 
     private async Task CompleteBloomPersistAsync()
@@ -1589,12 +2635,20 @@ internal sealed partial class ShardedHistoryWriter
         }
     }
 
+    private enum ShardWriteOp : byte
+    {
+        Insert = 0,
+        Tombstone = 1,
+        RecordAccess = 2,
+    }
+
     private readonly record struct ShardWriteRequest(
+        ShardWriteOp Op,
         ulong HashHi,
         ulong HashLo,
         ulong ServerHi,
         ulong ServerLo,
-        ShardCompletionSource Completion,
+        ShardCompletionSource? Completion,
         long? ChannelWriteStartTicks);
 
     private readonly record struct BloomPersistWork(string Path, ulong[] Words, int BitCount, int HashCount);
@@ -1740,9 +2794,15 @@ internal sealed partial class ShardedHistoryWriter
 
     WarmupShardDone:
 
+        string bloomPath = generation.BloomPaths[shardId];
+        if (ShouldSkipBloomIoForLowDisk(bloomPath))
+        {
+            return;
+        }
+
         try
         {
-            BloomFilter64.SaveToFile(generation.BloomPaths[shardId], bloom);
+            BloomFilter64.SaveToFile(bloomPath, bloom);
             generation.BloomShardTrusted[shardId] = true;
         }
         catch (Exception ex)
@@ -1814,9 +2874,15 @@ internal sealed partial class ShardedHistoryWriter
     {
         for (int shardId = 0; shardId < generation.BloomFilters.Length; shardId++)
         {
+            string path = generation.BloomPaths[shardId];
+            if (ShouldSkipBloomIoForLowDisk(path))
+            {
+                continue;
+            }
+
             try
             {
-                BloomFilter64.SaveToFile(generation.BloomPaths[shardId], generation.BloomFilters[shardId]);
+                BloomFilter64.SaveToFile(path, generation.BloomFilters[shardId]);
             }
             catch (Exception ex)
             {
@@ -1833,6 +2899,7 @@ internal sealed partial class ShardedHistoryWriter
         private readonly ulong[] _words;
         private readonly int _hashCount;
         private readonly int _bitMask;
+        private readonly ReaderWriterLockSlim _rw = new(LockRecursionPolicy.NoRecursion);
 
         public int BitCount => _bitMask + 1;
 
@@ -1915,11 +2982,16 @@ internal sealed partial class ShardedHistoryWriter
 
         private ulong[] CloneWordsLocked()
         {
-            lock (this)
+            _rw.EnterReadLock();
+            try
             {
                 ulong[] copy = new ulong[_words.Length];
                 Array.Copy(_words, copy, _words.Length);
                 return copy;
+            }
+            finally
+            {
+                _rw.ExitReadLock();
             }
         }
 
@@ -1928,7 +3000,8 @@ internal sealed partial class ShardedHistoryWriter
             ulong h1 = Mix(hashLo);
             ulong h2 = Mix(hashHi ^ 0x9E3779B97F4A7C15UL) | 1UL;
 
-            lock (this)
+            _rw.EnterWriteLock();
+            try
             {
                 for (int i = 0; i < _hashCount; i++)
                 {
@@ -1939,6 +3012,10 @@ internal sealed partial class ShardedHistoryWriter
                     _words[wordIndex] |= bit;
                 }
             }
+            finally
+            {
+                _rw.ExitWriteLock();
+            }
         }
 
         public bool MayContain(ulong hashHi, ulong hashLo)
@@ -1946,19 +3023,27 @@ internal sealed partial class ShardedHistoryWriter
             ulong h1 = Mix(hashLo);
             ulong h2 = Mix(hashHi ^ 0x9E3779B97F4A7C15UL) | 1UL;
 
-            for (int i = 0; i < _hashCount; i++)
+            _rw.EnterReadLock();
+            try
             {
-                ulong combined = h1 + ((ulong)i * h2);
-                int bitIndex = (int)(combined & (uint)_bitMask);
-                int wordIndex = bitIndex >> 6;
-                ulong bit = 1UL << (bitIndex & 63);
-                if ((Volatile.Read(ref _words[wordIndex]) & bit) == 0)
+                for (int i = 0; i < _hashCount; i++)
                 {
-                    return false;
+                    ulong combined = h1 + ((ulong)i * h2);
+                    int bitIndex = (int)(combined & (uint)_bitMask);
+                    int wordIndex = bitIndex >> 6;
+                    ulong bit = 1UL << (bitIndex & 63);
+                    if ((_words[wordIndex] & bit) == 0)
+                    {
+                        return false;
+                    }
                 }
-            }
 
-            return true;
+                return true;
+            }
+            finally
+            {
+                _rw.ExitReadLock();
+            }
         }
 
         private static ulong Mix(ulong x)

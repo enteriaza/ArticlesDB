@@ -1,10 +1,15 @@
 // HistoryDatabase.cs -- public HistoryDB API using string message IDs and server UUIDs, internally hashed to MD5 for storage.
 
-using System.Buffers;
-using System.Diagnostics;
-using System.Security.Cryptography;
-using System.Text;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Threading.Tasks;
+
+using HistoryDB.Contracts;
+using HistoryDB.Defrag;
+using HistoryDB.Repair;
+using HistoryDB.Utilities;
 
 using HistoryDB.Utilities;
 
@@ -15,23 +20,40 @@ namespace HistoryDB;
 /// <summary>
 /// Public HistoryDB entry point. Accepts string message IDs and server IDs, hashes them to MD5 internally, and delegates to the internal shard engine.
 /// </summary>
-public sealed class HistoryDatabase
+/// <remarks>
+/// <para>
+/// The walk/journal subsystem is opt-in for long-running deployments. When enabled, every successful insert appends a UTF-8 line
+/// to <c>history-journal.log</c> and a record to an in-memory ring buffer that backs <see cref="HistoryWalk(ref long, out HistoryWalkEntry, int)"/>.
+/// Disable the journal (<c>enableWalkJournal: false</c>) for high-throughput servers that do not consume the walk API; otherwise tune
+/// <c>maxWalkEntriesInMemory</c> to bound resident memory growth.
+/// </para>
+/// </remarks>
+public sealed partial class HistoryDatabase : IAsyncDisposable
 {
+    /// <summary>Default in-memory walk window. Bounded so very long-running processes do not accumulate unbounded RAM.</summary>
+    public const int DefaultMaxWalkEntriesInMemory = 1_048_576;
+
     private readonly ShardedHistoryWriter _writer;
     private readonly string _expiredPath;
     private readonly string _journalPath;
+    private readonly bool _enableWalkJournal;
+    private readonly int _maxWalkEntriesInMemory;
     private readonly object _stateLock = new();
     private readonly object _journalWriteLock = new();
+    private FileStream? _journalStream;
+    private StreamWriter? _journalWriter;
     private readonly HashSet<Hash128> _expired = [];
-    private readonly int _maxWalkEntries;
-    private readonly WalkRow[] _walkRing;
-    private int _walkHead;
-    private int _walkCount;
+    private long _walkEntriesEvicted;
+    private readonly ILogger _logger;
 
     /// <summary>
     /// Initializes a HistoryDB instance and activates internal generation processing.
     /// </summary>
-    /// <param name="maxWalkEntries">Maximum in-memory walk rows (FIFO ring). Oldest rows are overwritten after an insert when full.</param>
+    /// <param name="journalMaxFileBytesBeforeTrim">When &gt; 0 and journal length exceeds this, <see cref="HistorySync"/> may atomically rewrite the journal retaining only the tail (see <paramref name="journalTailRetainBytes"/>).</param>
+    /// <param name="journalTailRetainBytes">Bytes to keep when trimming (cap applied to current file size).</param>
+    /// <param name="journalBufferFlushThresholdBytes">Coalesce journal lines until this many UTF-8 bytes are buffered (then flush).</param>
+    /// <param name="journalCheckpointEveryNLines">Persist replay checkpoint every N successfully parsed journal lines during startup replay.</param>
+    /// <param name="minimumFreeDiskBytes">When non-zero, compaction and bloom snapshot paths skip work if free space on the data volume is below this threshold.</param>
     public HistoryDatabase(
         string rootPath,
         int shardCount = 128,
@@ -39,13 +61,37 @@ public sealed class HistoryDatabase
         ulong maxLoadFactorPercent = 75,
         int queueCapacityPerShard = 1_000_000,
         int maxRetainedGenerations = 8,
-        int maxWalkEntries = 1_000_000,
-        ILogger? logger = null)
+        bool enableWalkJournal = true,
+        int maxWalkEntriesInMemory = DefaultMaxWalkEntriesInMemory,
+        ILogger? logger = null,
+        long journalMaxFileBytesBeforeTrim = 0,
+        long journalTailRetainBytes = DefaultJournalTailRetainBytes,
+        int journalBufferFlushThresholdBytes = DefaultJournalBufferFlushThresholdBytes,
+        int journalCheckpointEveryNLines = DefaultJournalCheckpointLineInterval,
+        ulong minimumFreeDiskBytes = 0)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThan(maxWalkEntries, 1);
+        if (maxWalkEntriesInMemory < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxWalkEntriesInMemory), "maxWalkEntriesInMemory must be >= 0 (0 = unbounded).");
+        }
 
-        _maxWalkEntries = maxWalkEntries;
-        _walkRing = new WalkRow[maxWalkEntries];
+        _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+        string normalizedRoot = Path.GetFullPath(rootPath);
+        Directory.CreateDirectory(normalizedRoot);
+        _expiredPath = Path.Combine(normalizedRoot, "expired-md5.bin");
+        _journalPath = Path.Combine(normalizedRoot, "history-journal.log");
+        _journalCheckpointPath = Path.Combine(normalizedRoot, "history-journal.replay.chk");
+        _journalDirtyMarkerPath = Path.Combine(normalizedRoot, "history-journal.dirty");
+        _journalMaxFileBytesBeforeTrim = journalMaxFileBytesBeforeTrim;
+        _journalTailRetainBytes = journalTailRetainBytes > 0 ? journalTailRetainBytes : DefaultJournalTailRetainBytes;
+        _journalBufferFlushThreshold = journalBufferFlushThresholdBytes > 0 ? journalBufferFlushThresholdBytes : DefaultJournalBufferFlushThresholdBytes;
+        _journalCheckpointEveryNLines = journalCheckpointEveryNLines > 0 ? journalCheckpointEveryNLines : DefaultJournalCheckpointLineInterval;
+        _journalCircuit = new ConsecutiveFailureCircuit(5, TimeSpan.FromSeconds(60));
+        _enableWalkJournal = enableWalkJournal;
+        _maxWalkEntriesInMemory = maxWalkEntriesInMemory;
+
+        InitWalkStorage();
+
         _writer = new ShardedHistoryWriter(
             rootPath: rootPath,
             shardCount: shardCount,
@@ -53,22 +99,39 @@ public sealed class HistoryDatabase
             maxLoadFactorPercent: maxLoadFactorPercent,
             queueCapacityPerShard: queueCapacityPerShard,
             maxRetainedGenerations: maxRetainedGenerations,
+            minimumFreeDiskBytes: minimumFreeDiskBytes,
             logger: logger);
 
-        string normalizedRoot = Path.GetFullPath(rootPath);
-        Directory.CreateDirectory(normalizedRoot);
-        _expiredPath = Path.Combine(normalizedRoot, "expired-md5.bin");
-        _journalPath = Path.Combine(normalizedRoot, "history-journal.log");
         LoadExpiredSet();
-        LoadJournal();
+        if (_enableWalkJournal)
+        {
+            LoadJournal();
+        }
+
+        TryDeleteJournalDirtyMarker();
     }
+
+    /// <summary>Whether repeated journal flush failures have opened the short-term circuit (writes may be skipped until cooldown).</summary>
+    public bool IsJournalCircuitOpen => _journalCircuit.IsOpen;
+
+    /// <summary>Whether Bloom checkpoint persistence circuit is open on the writer.</summary>
+    public bool IsBloomPersistCircuitOpen => _writer.IsBloomPersistCircuitOpen;
+
+    /// <summary>Captured non-fault-free shutdown task exceptions from writer/scrub threads (empty when clean).</summary>
+    public IReadOnlyList<Exception> GetShutdownFaults() => _writer.GetShutdownFaults();
+
+    /// <summary>Operational health flags for hosts (liveness dashboards).</summary>
+    public HistoryHealthSnapshot GetHealthSnapshot() =>
+        new(IsJournalCircuitOpen, IsBloomPersistCircuitOpen, File.Exists(_journalDirtyMarkerPath));
 
     /// <summary>
     /// Checks if a message ID exists and has not been expired.
     /// </summary>
-    /// <exception cref="InvalidDataException">Thrown when on-disk structures fail validation.</exception>
-    /// <exception cref="IOException">Thrown when storage access fails.</exception>
-    public bool HistoryLookup(string messageId)
+    public bool HistoryLookup(string messageId) =>
+        HistoryLookupAsync(messageId, default).AsTask().ConfigureAwait(false).GetAwaiter().GetResult();
+
+    /// <summary>Async lookup; avoids extra thread-pool hop when used from async hosts.</summary>
+    public async ValueTask<bool> HistoryLookupAsync(string messageId, CancellationToken cancellationToken = default)
     {
         Hash128 messageHash = ComputeMd5(messageId);
         lock (_stateLock)
@@ -79,19 +142,17 @@ public sealed class HistoryDatabase
             }
         }
 
-        return _writer.Exists(messageHash.Hi, messageHash.Lo);
+        return await _writer.ExistsAndRecordAccessAsync(messageHash.Hi, messageHash.Lo, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Adds a message ID with server UUID. Returns true when inserted, false when duplicate/full/probe-limit.
     /// </summary>
     public bool HistoryAdd(string messageId, string serverId) =>
-        HistoryAddAsync(messageId, serverId, CancellationToken.None).GetAwaiter().GetResult();
+        HistoryAddAsync(messageId, serverId, default).AsTask().ConfigureAwait(false).GetAwaiter().GetResult();
 
-    /// <summary>
-    /// Adds a message ID with server UUID. On successful insert, appends the journal line before updating the in-memory walk ring.
-    /// </summary>
-    public async Task<bool> HistoryAddAsync(string messageId, string serverId, CancellationToken cancellationToken = default)
+    /// <summary>Async insert with journal/walk/expired persistence ordering.</summary>
+    public async ValueTask<bool> HistoryAddAsync(string messageId, string serverId, CancellationToken cancellationToken = default)
     {
         if (!Guid.TryParse(serverId, out _))
         {
@@ -100,19 +161,39 @@ public sealed class HistoryDatabase
 
         Hash128 messageHash = ComputeMd5(messageId);
         Hash128 serverHash = ComputeMd5(serverId);
-        ShardInsertResult result =
-            await _writer.EnqueueAsync(messageHash.Hi, messageHash.Lo, serverHash.Hi, serverHash.Lo, cancellationToken)
-                .ConfigureAwait(false);
-        if (result != ShardInsertResult.Inserted)
+        ShardInsertResult result = await _writer.EnqueueAsync(messageHash.Hi, messageHash.Lo, serverHash.Hi, serverHash.Lo, cancellationToken).ConfigureAwait(false);
+        if (result == ShardInsertResult.Inserted)
         {
-            return false;
-        }
+            if (_enableWalkJournal)
+            {
+                try
+                {
+                    AppendJournalLineBuffered(messageId, serverId, messageHash);
+                }
+                catch (Exception ex)
+                {
+                    LogJournalAppendAfterInsertFailed(ex);
+                    WriteJournalDirtyMarker();
+                    throw;
+                }
 
-        AppendJournalLine(messageId, serverId);
-        lock (_stateLock)
-        {
-            _expired.Remove(messageHash);
-            AppendWalkRow(new WalkRow(messageHash, new HistoryWalkEntry(messageId, serverId, DateTimeOffset.UtcNow)));
+                lock (_stateLock)
+                {
+                    _expired.Remove(messageHash);
+                    AppendWalkEntry_NoLock(new HistoryWalkEntry(messageId, serverId, DateTimeOffset.UtcNow, messageHash));
+                    PersistExpiredSetCore();
+                }
+            }
+            else
+            {
+                lock (_stateLock)
+                {
+                    _expired.Remove(messageHash);
+                    PersistExpiredSetCore();
+                }
+            }
+
+            return true;
         }
 
         return true;
@@ -138,21 +219,27 @@ public sealed class HistoryDatabase
     }
 
     /// <summary>
-    /// Expires one message ID. Expired entries are skipped by lookup/walk.
+    /// Expires one message ID. Expired entries are skipped by lookup/walk and a best-effort tombstone broadcast is sent to every retained generation's shard channel.
     /// </summary>
     public bool HistoryExpire(string messageId)
     {
         Hash128 messageHash = ComputeMd5(messageId);
+        bool added;
         lock (_stateLock)
         {
-            bool added = _expired.Add(messageHash);
+            added = _expired.Add(messageHash);
             if (added)
             {
-                PersistExpiredSetWhileLocked();
+                PersistExpiredSetCore();
             }
-
-            return added;
         }
+
+        if (added)
+        {
+            BroadcastTombstoneFireAndForget(messageHash);
+        }
+
+        return added;
     }
 
     /// <summary>
@@ -166,19 +253,30 @@ public sealed class HistoryDatabase
         }
 
         int changed = 0;
+        List<Hash128>? newlyExpired = null;
         lock (_stateLock)
         {
             for (int i = 0; i < messageIds.Length; i++)
             {
-                if (_expired.Add(ComputeMd5(messageIds[i])))
+                Hash128 hash = ComputeMd5(messageIds[i]);
+                if (_expired.Add(hash))
                 {
                     changed++;
+                    (newlyExpired ??= new List<Hash128>(messageIds.Length)).Add(hash);
                 }
             }
 
-            if (changed != 0)
+            if (changed > 0)
             {
-                PersistExpiredSetWhileLocked();
+                PersistExpiredSetCore();
+            }
+        }
+
+        if (newlyExpired is not null)
+        {
+            for (int i = 0; i < newlyExpired.Count; i++)
+            {
+                BroadcastTombstoneFireAndForget(newlyExpired[i]);
             }
         }
 
@@ -186,41 +284,149 @@ public sealed class HistoryDatabase
     }
 
     /// <summary>
-    /// Synchronizes internal history metadata, shard headers, and bloom files to disk.
+    /// Returns whether the MD5 message hash is present in the in-memory expired filter (same semantics as lookup suppression).
     /// </summary>
-    public void HistorySync()
+    public bool IsMessageHashExpired(Hash128 messageHash)
     {
-        _writer.Sync();
         lock (_stateLock)
         {
-            PersistExpiredSetWhileLocked();
+            return _expired.Contains(messageHash);
         }
     }
 
     /// <summary>
-    /// Procedural walk API. Returns 1 when an entry is produced; returns 0 when end is reached.
+    /// Expires many content hashes (for example from a slot harvest). Adds each hash to the expired set, persists
+    /// <c>expired-md5.bin</c>, and tombstones across retained generations in bounded parallel batches.
     /// </summary>
-    public int HistoryWalk(ref long position, out HistoryWalkEntry entry, int flags = 0)
+    public async Task<int> HistoryExpireByHashesAsync(
+        IReadOnlyList<Hash128> hashes,
+        int parallelTombstones = 64,
+        CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(hashes);
+        if (hashes.Count == 0)
+        {
+            return 0;
+        }
+
+        if (parallelTombstones < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(parallelTombstones), "parallelTombstones must be >= 1.");
+        }
+
+        List<Hash128> newlyExpired = [];
         lock (_stateLock)
         {
-            while (position >= 0 && position < _walkCount)
+            for (int i = 0; i < hashes.Count; i++)
             {
-                int idx = (int)(((ulong)_walkHead + (ulong)position) % (ulong)_maxWalkEntries);
-                position++;
-                WalkRow current = _walkRing[idx];
-                if (_expired.Contains(current.MessageHash))
+                Hash128 h = hashes[i];
+                if (_expired.Add(h))
                 {
-                    continue;
+                    newlyExpired.Add(h);
                 }
-
-                entry = current.Entry;
-                return 1;
             }
         }
 
-        entry = default;
-        return 0;
+        if (newlyExpired.Count == 0)
+        {
+            return 0;
+        }
+
+        for (int offset = 0; offset < newlyExpired.Count; offset += parallelTombstones)
+        {
+            int batch = Math.Min(parallelTombstones, newlyExpired.Count - offset);
+            Task[] tasks = new Task[batch];
+            for (int j = 0; j < batch; j++)
+            {
+                Hash128 h = newlyExpired[offset + j];
+                tasks[j] = _writer.EnqueueTombstoneAcrossGenerationsAsync(h.Hi, h.Lo, cancellationToken).AsTask();
+            }
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+
+        PersistExpiredSet();
+        return newlyExpired.Count;
+    }
+
+    /// <summary>
+    /// Enumerates occupied slot metadata across all generations. Optionally skips hashes already in the expired set.
+    /// </summary>
+    public async IAsyncEnumerable<StoredArticleMetadata> EnumerateStoredArticleMetadataAsync(
+        bool skipIfExpired = true,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        HashSet<Hash128>? expiredSnap = null;
+        if (skipIfExpired)
+        {
+            lock (_stateLock)
+            {
+                expiredSnap = new HashSet<Hash128>(_expired);
+            }
+        }
+
+        await foreach (StoredArticleMetadata row in _writer.EnumerateStoredArticleMetadataAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (expiredSnap is not null && expiredSnap.Contains(row.MessageHash))
+            {
+                continue;
+            }
+
+            yield return row;
+        }
+    }
+
+    private void BroadcastTombstoneFireAndForget(Hash128 messageHash)
+    {
+        try
+        {
+            ValueTask<int> pending = _writer.EnqueueTombstoneAcrossGenerationsAsync(messageHash.Hi, messageHash.Lo, CancellationToken.None);
+            if (!pending.IsCompletedSuccessfully)
+            {
+                pending.AsTask().ContinueWith(
+                    static (t, state) =>
+                    {
+                        HistoryDatabase db = (HistoryDatabase)state!;
+                        if (t.IsFaulted && t.Exception is not null)
+                        {
+                            db.LogTombstoneBroadcastTaskFaulted(t.Exception.GetBaseException());
+                        }
+                    },
+                    this,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogTombstoneBroadcastSyncFailed(ex);
+        }
+    }
+
+    /// <summary>
+    /// Synchronizes internal history metadata, shard headers, and bloom files to disk.
+    /// </summary>
+    public void HistorySync()
+    {
+        lock (_journalWriteLock)
+        {
+            JournalSyncMaintenance_NoLock();
+        }
+
+        _writer.Sync();
+        PersistExpiredSet();
+    }
+
+    /// <summary>
+    /// Returns the number of walk entries evicted from the in-memory window since process start (FIFO retention).
+    /// </summary>
+    public long GetEvictedWalkEntryCount()
+    {
+        lock (_stateLock)
+        {
+            return _walkEntriesEvicted;
+        }
     }
 
     public void SetBloomCheckpointInsertInterval(ulong inserts) => _writer.SetBloomCheckpointInsertInterval(inserts);
@@ -243,24 +449,135 @@ public sealed class HistoryDatabase
             m.UsedSlotsApprox);
     }
 
-    internal async ValueTask DisposeAsync()
+    /// <summary>Flushes metadata and releases mmap-backed shard writers.</summary>
+    public async ValueTask DisposeAsync()
     {
         HistorySync();
+        lock (_journalWriteLock)
+        {
+            try
+            {
+                _journalWriter?.Flush();
+            }
+            catch (Exception ex)
+            {
+                LogJournalWriterFlushDisposeFailed(ex);
+            }
+
+            _journalWriter?.Dispose();
+            _journalWriter = null;
+            try
+            {
+                _journalStream?.Flush(flushToDisk: true);
+            }
+            catch (Exception ex)
+            {
+                LogJournalStreamFlushDisposeFailed(ex);
+            }
+
+            _journalStream?.Dispose();
+            _journalStream = null;
+        }
+
         await _writer.DisposeAsync().ConfigureAwait(false);
     }
 
-    private void AppendWalkRow(WalkRow row)
+    public static Task<HistoryRepairReport> ScanAsync(
+        string rootPath,
+        HistoryScanOptions? options = null,
+        ILogger? logger = null,
+        CancellationToken cancellationToken = default) =>
+        HistoryRepairEngine.ScanAsync(rootPath, options, logger, cancellationToken);
+
+    public static Task<HistoryRepairReport> RepairAsync(
+        string rootPath,
+        HistoryRepairOptions options,
+        ILogger? logger = null,
+        CancellationToken cancellationToken = default) =>
+        HistoryRepairEngine.RepairAsync(rootPath, options, logger, cancellationToken);
+
+    public Task<HistoryDefragReport> HistoryDefragAsync(
+        HistoryDefragOptions? options = null,
+        CancellationToken cancellationToken = default)
     {
-        if (_walkCount < _maxWalkEntries)
+        HistoryDefragOptions effective = options ?? new HistoryDefragOptions();
+        IReadOnlySet<Hash128> snapshot = SnapshotExpiredHashesForDefrag();
+        return HistoryDefragEngine.RunAsync(this, _writer, snapshot, effective, _logger, cancellationToken);
+    }
+
+    private HashSet<Hash128> SnapshotExpiredHashesForDefrag()
+    {
+        lock (_stateLock)
         {
-            int idx = (int)(((ulong)_walkHead + (ulong)_walkCount) % (ulong)_maxWalkEntries);
-            _walkRing[idx] = row;
-            _walkCount++;
-            return;
+            return new HashSet<Hash128>(_expired);
+        }
+    }
+
+    internal async Task<long> PruneExpiredSetAfterDefragAsync(CancellationToken cancellationToken)
+    {
+        Hash128[] snapshot;
+        lock (_stateLock)
+        {
+            snapshot = new Hash128[_expired.Count];
+            int idx = 0;
+            foreach (Hash128 h in _expired)
+            {
+                snapshot[idx++] = h;
+            }
         }
 
-        _walkRing[_walkHead] = row;
-        _walkHead = (_walkHead + 1) % _maxWalkEntries;
+        if (snapshot.Length == 0)
+        {
+            return 0;
+        }
+
+        List<Hash128> toRemove = new();
+        int yieldCounter = 0;
+        for (int i = 0; i < snapshot.Length; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if ((++yieldCounter & 0x3FF) == 0)
+            {
+                await Task.Yield();
+            }
+
+            Hash128 h = snapshot[i];
+            if (!_writer.Exists(h.Hi, h.Lo))
+            {
+                toRemove.Add(h);
+            }
+        }
+
+        if (toRemove.Count == 0)
+        {
+            return 0;
+        }
+
+        long pruned = 0;
+        lock (_stateLock)
+        {
+            for (int i = 0; i < toRemove.Count; i++)
+            {
+                if (_expired.Remove(toRemove[i]))
+                {
+                    pruned++;
+                }
+            }
+        }
+
+        if (pruned > 0)
+        {
+            try
+            {
+                PersistExpiredSet();
+            }
+            catch (Exception ex)
+            {
+                LogPersistExpiredAfterPruneFailed(ex);
+            }
+        }
+
+        return pruned;
     }
 
     private void LoadExpiredSet()
@@ -270,126 +587,49 @@ public sealed class HistoryDatabase
             return;
         }
 
-        byte[] bytes = File.ReadAllBytes(_expiredPath);
-        ReadOnlyMemory<byte> hashRegion = ExpiredSetFile.ParseHashesOrThrow(bytes);
-        ReadOnlySpan<byte> span = hashRegion.Span;
-        for (int offset = 0; offset + 16 <= span.Length; offset += 16)
+        if (ExpiredSetFile.TryLoadFormatted(_expiredPath, _expired, out string? formattedError))
         {
-            ulong hi = BitConverter.ToUInt64(span[offset..]);
-            ulong lo = BitConverter.ToUInt64(span[(offset + 8)..]);
+            if (formattedError is not null)
+            {
+                throw new InvalidDataException(formattedError);
+            }
+
+            return;
+        }
+
+        byte[] bytes = File.ReadAllBytes(_expiredPath);
+        if (bytes.Length % 16 != 0)
+        {
+            throw new InvalidDataException(
+                $"Legacy expired-md5.bin length {bytes.Length} is not a multiple of 16 bytes (partial write or corruption).");
+        }
+
+        for (int offset = 0; offset + 16 <= bytes.Length; offset += 16)
+        {
+            ulong hi = BitConverter.ToUInt64(bytes, offset);
+            ulong lo = BitConverter.ToUInt64(bytes, offset + 8);
             _expired.Add(new Hash128(hi, lo));
         }
     }
 
-    private void PersistExpiredSetWhileLocked()
+    private void PersistExpiredSet()
     {
-        byte[] entries = new byte[_expired.Count * 16];
-        int o = 0;
-        foreach (Hash128 hash in _expired)
+        lock (_stateLock)
         {
-            BitConverter.TryWriteBytes(entries.AsSpan(o, 8), hash.Hi);
-            BitConverter.TryWriteBytes(entries.AsSpan(o + 8, 8), hash.Lo);
-            o += 16;
-        }
-
-        byte[] payload = ExpiredSetFile.BuildPayload(entries);
-        File.WriteAllBytes(_expiredPath, payload);
-    }
-
-    private void LoadJournal()
-    {
-        if (!File.Exists(_journalPath))
-        {
-            return;
-        }
-
-        long lineNumber = 0;
-        foreach (string line in File.ReadLines(_journalPath))
-        {
-            lineNumber++;
-            try
-            {
-                string[] parts = line.Split('|');
-                if (parts.Length != 3)
-                {
-                    continue;
-                }
-
-                string messageId = Encoding.UTF8.GetString(Convert.FromBase64String(parts[0]));
-                string serverId = Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]));
-                if (!long.TryParse(parts[2], out long ticks))
-                {
-                    continue;
-                }
-
-                Hash128 mh = ComputeMd5(messageId);
-                AppendWalkRow(new WalkRow(mh, new HistoryWalkEntry(messageId, serverId, new DateTimeOffset(ticks, TimeSpan.Zero))));
-            }
-            catch (Exception ex)
-            {
-                Trace.TraceWarning(
-                    "[HistoryDB] Skipping malformed journal line {0} in {1}: {2}",
-                    lineNumber,
-                    _journalPath,
-                    ex.Message);
-            }
+            PersistExpiredSetCore();
         }
     }
 
-    private void AppendJournalLine(string messageId, string serverId)
+    private void PersistExpiredSetCore()
     {
-        string line =
-            $"{Convert.ToBase64String(Encoding.UTF8.GetBytes(messageId))}|{Convert.ToBase64String(Encoding.UTF8.GetBytes(serverId))}|{DateTimeOffset.UtcNow.Ticks}";
-        lock (_journalWriteLock)
-        {
-            using var stream = new FileStream(
-                _journalPath,
-                FileMode.Append,
-                FileAccess.Write,
-                FileShare.Read,
-                bufferSize: 4096,
-                options: FileOptions.None);
-            using var writer = new StreamWriter(stream, Encoding.UTF8);
-            writer.WriteLine(line);
-            writer.Flush();
-            stream.Flush(flushToDisk: true);
-        }
+        ExpiredSetFile.WriteAtomic(_expiredPath, _expired);
     }
-
-    private static Hash128 ComputeMd5(string text)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(text);
-        int byteCount = Encoding.UTF8.GetByteCount(text);
-        const int StackThreshold = 512;
-        byte[]? rented = null;
-        Span<byte> utf8 = byteCount <= StackThreshold ? stackalloc byte[byteCount] : (rented = ArrayPool<byte>.Shared.Rent(byteCount)).AsSpan(0, byteCount);
-        try
-        {
-            Encoding.UTF8.GetBytes(text, utf8);
-            Span<byte> hash = stackalloc byte[16];
-            MD5.HashData(utf8, hash);
-            ulong hi = BitConverter.ToUInt64(hash[..8]);
-            ulong lo = BitConverter.ToUInt64(hash[8..]);
-            return new Hash128(hi, lo);
-        }
-        finally
-        {
-            if (rented is not null)
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
-        }
-    }
-
-    private readonly record struct Hash128(ulong Hi, ulong Lo);
-
-    private readonly record struct WalkRow(Hash128 MessageHash, HistoryWalkEntry Entry);
 }
 
 /// <summary>
 /// A walked history record returned by <see cref="HistoryDatabase.HistoryWalk(ref long, out HistoryWalkEntry, int)"/>.
 /// </summary>
-public readonly record struct HistoryWalkEntry(string MessageId, string ServerId, DateTimeOffset CreatedAtUtc);
+public readonly record struct HistoryWalkEntry(string MessageId, string ServerId, DateTimeOffset CreatedAtUtc, Hash128 MessageHash);
 
 /// <summary>
 /// Snapshot of internal pressure and failure counters.
@@ -401,3 +641,9 @@ public readonly record struct HistoryPerformanceSnapshot(
     long FullInsertFailures,
     long ProbeLimitFailures,
     ulong UsedSlotsApprox);
+
+/// <summary>Host-facing degraded-mode indicators.</summary>
+public readonly record struct HistoryHealthSnapshot(
+    bool JournalCircuitOpen,
+    bool BloomPersistCircuitOpen,
+    bool JournalDirtyMarkerPresent);

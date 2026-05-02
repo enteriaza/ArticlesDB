@@ -4,7 +4,7 @@ using System.Diagnostics;
 
 namespace HisBench.Infrastructure;
 
-internal sealed class ColdRestartCoordinator : IColdRestartCoordinator
+internal sealed partial class ColdRestartCoordinator : IColdRestartCoordinator
 {
     private readonly ILogger<ColdRestartCoordinator> _logger;
 
@@ -29,12 +29,15 @@ internal sealed class ColdRestartCoordinator : IColdRestartCoordinator
 
     private async Task TryLinuxDropCaches(CancellationToken ct)
     {
+        // Prefer /bin/sh (POSIX, present on every Linux distro including Alpine/busybox); falls back to bash if /bin/sh
+        // is missing for some reason. The drop_caches write requires root: when sudo is unavailable we just log and continue.
+        string shell = File.Exists("/bin/sh") ? "/bin/sh" : "bash";
         try
         {
             using Process proc = Process.Start(new ProcessStartInfo
             {
-                FileName = "bash",
-                ArgumentList = { "-lc", "sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null" },
+                FileName = shell,
+                ArgumentList = { "-c", "sync; (echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null) || (echo 3 > /proc/sys/vm/drop_caches)" },
                 UseShellExecute = false,
                 CreateNoWindow = true
             })!;
@@ -42,7 +45,7 @@ internal sealed class ColdRestartCoordinator : IColdRestartCoordinator
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Linux cold restart cache drop failed.");
+            LogLinuxColdRestartFailed(_logger, ex);
         }
     }
 
@@ -54,7 +57,7 @@ internal sealed class ColdRestartCoordinator : IColdRestartCoordinator
             string ramMapPath = Path.Combine(sysRoot, "System32", "RAMMap.exe");
             if (!File.Exists(ramMapPath))
             {
-                _logger.LogInformation("RAMMap.exe not found, skipping Windows standby list purge.");
+                LogRamMapNotFound(_logger);
                 return;
             }
 
@@ -69,7 +72,16 @@ internal sealed class ColdRestartCoordinator : IColdRestartCoordinator
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Windows cold restart purge failed.");
+            LogWindowsColdRestartFailed(_logger, ex);
         }
     }
+
+    [LoggerMessage(EventId = 3000, Level = LogLevel.Warning, Message = "Linux cold restart cache drop failed.")]
+    private static partial void LogLinuxColdRestartFailed(ILogger logger, Exception ex);
+
+    [LoggerMessage(EventId = 3001, Level = LogLevel.Information, Message = "RAMMap.exe not found, skipping Windows standby list purge.")]
+    private static partial void LogRamMapNotFound(ILogger logger);
+
+    [LoggerMessage(EventId = 3002, Level = LogLevel.Warning, Message = "Windows cold restart purge failed.")]
+    private static partial void LogWindowsColdRestartFailed(ILogger logger, Exception ex);
 }

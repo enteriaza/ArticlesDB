@@ -1,89 +1,116 @@
-// ExpiredSetFile.cs -- versioned expired-hash blob with trailing CRC-32; migrates legacy raw 16-byte records.
-
 using System.Buffers.Binary;
-using System.IO;
+using System.Diagnostics;
+using System.IO.Hashing;
+
+using HistoryDB.Contracts;
 
 namespace HistoryDB.Utilities;
 
 /// <summary>
-/// On-disk layout for <c>expired-md5.bin</c>.
+/// Atomic on-disk format for <c>expired-md5.bin</c>: header + CRC32 over payload + 16-byte MD5 hashes per entry.
 /// </summary>
 internal static class ExpiredSetFile
 {
-    /// <summary>Magic "EXPD" little-endian.</summary>
-    internal const uint FileMagic = 0x44505845;
+    internal const uint FileMagic = 0x44505845; // "EXPD" little-endian
 
     internal const uint FileVersion = 1;
 
-    /// <summary>
-    /// Header (12 bytes) + <c>entryCount * 16</c> + CRC-32 (4 bytes). CRC covers bytes [0 .. 12+count*16).
-    /// </summary>
-    internal static byte[] BuildPayload(ReadOnlySpan<byte> entries16)
+    /// <summary>magic(4) + version(4) + count(8) + payloadCrc(4) + reserved(4).</summary>
+    internal const int HeaderByteLength = 24;
+
+    internal static void WriteAtomic(string destinationPath, IReadOnlyCollection<Hash128> hashes)
     {
-        if ((entries16.Length % 16) != 0)
+        ArgumentNullException.ThrowIfNull(hashes);
+        string? directory = Path.GetDirectoryName(destinationPath);
+        if (string.IsNullOrEmpty(directory))
         {
-            throw new ArgumentException("Expired hash payload length must be a multiple of 16.", nameof(entries16));
+            throw new ArgumentException("path must include a directory component.", nameof(destinationPath));
         }
 
-        int entryCount = entries16.Length / 16;
-        byte[] buffer = new byte[12 + entries16.Length + 4];
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(0, 4), FileMagic);
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(4, 4), FileVersion);
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(8, 4), (uint)entryCount);
-        entries16.CopyTo(buffer.AsSpan(12));
-        uint crc = Crc32Ieee.Compute(buffer.AsSpan(0, 12 + entries16.Length));
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(12 + entries16.Length, 4), crc);
-        return buffer;
+        Directory.CreateDirectory(directory);
+        string tempPath = destinationPath + ".tmp";
+
+        byte[] payload = new byte[checked(hashes.Count * 16)];
+        int offset = 0;
+        foreach (Hash128 hash in hashes)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(offset, 8), hash.Hi);
+            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(offset + 8, 8), hash.Lo);
+            offset += 16;
+        }
+
+        uint payloadCrc = Crc32.HashToUInt32(payload);
+
+        using (FileStream stream = File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        using (BinaryWriter writer = new(stream))
+        {
+            writer.Write(FileMagic);
+            writer.Write(FileVersion);
+            writer.Write((ulong)hashes.Count);
+            writer.Write(payloadCrc);
+            writer.Write(0u);
+            writer.Write(payload);
+            writer.Flush();
+            stream.Flush(flushToDisk: true);
+        }
+
+        File.Move(tempPath, destinationPath, overwrite: true);
     }
 
     /// <summary>
-    /// Parses legacy (raw hashes) or versioned file. Returns 16-byte-aligned hash entries only.
+    /// Returns <see langword="true"/> when the file uses the formatted header (magic matches), even if validation fails (<paramref name="error"/> set).
+    /// Returns <see langword="false"/> for legacy raw files (no magic).
     /// </summary>
-    internal static ReadOnlyMemory<byte> ParseHashesOrThrow(ReadOnlySpan<byte> fileBytes)
+    internal static bool TryLoadFormatted(string path, HashSet<Hash128> into, out string? error)
     {
-        if (fileBytes.Length == 0)
+        error = null;
+        byte[] bytes = File.ReadAllBytes(path);
+        if (bytes.Length < HeaderByteLength)
         {
-            return ReadOnlyMemory<byte>.Empty;
+            return false;
         }
 
-        if (fileBytes.Length >= 12
-            && BinaryPrimitives.ReadUInt32LittleEndian(fileBytes) == FileMagic)
+        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(0, 4));
+        if (magic != FileMagic)
         {
-            uint version = BinaryPrimitives.ReadUInt32LittleEndian(fileBytes[4..]);
-            if (version != FileVersion)
-            {
-                throw new InvalidDataException($"Unsupported expired set version {version}.");
-            }
-
-            int entryCount = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(fileBytes[8..]));
-            long payloadBytes = 12L + (entryCount * 16L) + 4L;
-            if (fileBytes.Length < payloadBytes)
-            {
-                throw new InvalidDataException("Expired set file truncated (headers/entries/CRC).");
-            }
-
-            if (fileBytes.Length != payloadBytes)
-            {
-                throw new InvalidDataException("Expired set file has trailing garbage after CRC.");
-            }
-
-            ReadOnlySpan<byte> bodyForCrc = fileBytes[..(12 + (entryCount * 16))];
-            uint expected = BinaryPrimitives.ReadUInt32LittleEndian(fileBytes[(12 + (entryCount * 16))..]);
-            uint actual = Crc32Ieee.Compute(bodyForCrc);
-            if (expected != actual)
-            {
-                throw new InvalidDataException($"Expired set CRC mismatch (expected {expected:X8}, actual {actual:X8}).");
-            }
-
-            return fileBytes[12..(12 + (entryCount * 16))].ToArray();
+            return false;
         }
 
-        // Legacy: raw multiple of 16 bytes, no CRC
-        if ((fileBytes.Length % 16) != 0)
+        uint version = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(4, 4));
+        if (version != FileVersion)
         {
-            throw new InvalidDataException("Legacy expired set file length is not a multiple of 16.");
+            error = $"Unsupported expired-set file version {version}.";
+            Trace.TraceWarning("[HistoryDB] {0}", error);
+            return true;
         }
 
-        return fileBytes.ToArray();
+        ulong count = BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(8, 8));
+        uint declaredCrc = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(16, 4));
+
+        long expectedLen = HeaderByteLength + checked((long)count * 16L);
+        if (bytes.Length != expectedLen)
+        {
+            error = $"Expired-set file length {bytes.Length} != expected {expectedLen} for count={count}.";
+            Trace.TraceWarning("[HistoryDB] {0}", error);
+            return true;
+        }
+
+        ReadOnlySpan<byte> payload = bytes.AsSpan(HeaderByteLength);
+        uint computed = Crc32.HashToUInt32(payload);
+        if (computed != declaredCrc)
+        {
+            error = "Expired-set payload CRC mismatch.";
+            Trace.TraceWarning("[HistoryDB] {0}", error);
+            return true;
+        }
+
+        for (int i = 0; i < payload.Length; i += 16)
+        {
+            ulong hi = BinaryPrimitives.ReadUInt64LittleEndian(payload.Slice(i, 8));
+            ulong lo = BinaryPrimitives.ReadUInt64LittleEndian(payload.Slice(i + 8, 8));
+            into.Add(new Hash128(hi, lo));
+        }
+
+        return true;
     }
 }
