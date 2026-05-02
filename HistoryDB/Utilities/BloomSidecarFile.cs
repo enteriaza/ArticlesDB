@@ -1,43 +1,24 @@
-// BloomSidecarFile.cs -- binary layout and atomic write for per-shard Bloom filter sidecars (.bloom) shared by load and save paths.
-// Uses temp file plus replace to avoid torn reads; callers supply word buffers matching bitCount / hashCount metadata.
+// BloomSidecarFile.cs -- binary layout and atomic write for per-shard Bloom filter sidecars (.idx) with trailing CRC-32 (v2).
 
+using System.Buffers.Binary;
 using System.IO;
 
 namespace HistoryDB.Utilities;
 
 /// <summary>
-/// File format helpers for Bloom sidecar persistence (magic, versioned header, ulong[] payload).
+/// File format helpers for Bloom sidecar persistence (magic, versioned header, ulong[] payload, CRC-32 in v2).
 /// </summary>
-/// <remarks>
-/// <para>
-/// <b>On-disk layout:</b> <c>uint magic</c>, <c>uint version</c>, <c>int bitCount</c>, <c>int hashCount</c>, <c>int wordCount</c>, then <c>wordCount</c> little-endian <see cref="ulong"/> values.
-/// </para>
-/// <para>
-/// <b>Thread safety:</b> <see cref="WriteSidecar(string, ulong[], int, int)"/> must not be invoked concurrently for the same <paramref name="path"/>; concurrent writes to different paths are supported by the OS.
-/// </para>
-/// </remarks>
 internal static class BloomSidecarFile
 {
-    /// <summary>
-    /// File magic identifying HistoryDB Bloom sidecars (truncated ASCII tag).
-    /// </summary>
     internal const uint FileMagic = 0x4D4F4F4C;
 
-    /// <summary>
-    /// Current on-disk format version for <see cref="FileMagic"/>.
-    /// </summary>
-    internal const uint FileVersion = 1;
+    internal const uint FileVersionV1 = 1;
+
+    internal const uint FileVersionV2 = 2;
 
     /// <summary>
-    /// Writes a Bloom sidecar atomically (temp file, flush, move) so readers never observe a partial file.
+    /// Writes v2 sidecar atomically: metadata + words + IEEE CRC-32 over all preceding bytes.
     /// </summary>
-    /// <param name="path">Destination path, typically <c>shard-xxxxx.bloom</c> under a generation directory.</param>
-    /// <param name="words">Little-endian bit array in 64-bit words; length must equal <c>bitCount / 64</c>.</param>
-    /// <param name="bitCount">Power-of-two bit slot count.</param>
-    /// <param name="hashCount">Number of hash functions used when inserting.</param>
-    /// <exception cref="ArgumentException">Thrown when <paramref name="words"/> length does not match <paramref name="bitCount"/>.</exception>
-    /// <exception cref="IOException">Thrown when the underlying file system rejects create, flush, or rename.</exception>
-    /// <exception cref="UnauthorizedAccessException">Thrown when the process lacks permission to write <paramref name="path"/>.</exception>
     internal static void WriteSidecar(string path, ulong[] words, int bitCount, int hashCount)
     {
         int wordCount = bitCount >> 6;
@@ -55,23 +36,98 @@ internal static class BloomSidecarFile
         Directory.CreateDirectory(directory);
         string tempPath = path + ".tmp";
 
-        using (FileStream stream = File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
-        using (BinaryWriter writer = new(stream))
+        byte[] body;
+        using (var ms = new MemoryStream(capacity: 20 + (wordCount * 8)))
+        using (var bw = new BinaryWriter(ms))
         {
-            writer.Write(FileMagic);
-            writer.Write(FileVersion);
-            writer.Write(bitCount);
-            writer.Write(hashCount);
-            writer.Write(wordCount);
+            bw.Write(FileMagic);
+            bw.Write(FileVersionV2);
+            bw.Write(bitCount);
+            bw.Write(hashCount);
+            bw.Write(wordCount);
             for (int i = 0; i < wordCount; i++)
             {
-                writer.Write(words[i]);
+                bw.Write(words[i]);
             }
 
-            writer.Flush();
+            bw.Flush();
+            body = ms.ToArray();
+        }
+
+        uint crc = Crc32Ieee.Compute(body);
+        using (FileStream stream = File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            stream.Write(body);
+            Span<byte> crcB = stackalloc byte[4];
+            BinaryPrimitives.WriteUInt32LittleEndian(crcB, crc);
+            stream.Write(crcB);
             stream.Flush(flushToDisk: true);
         }
 
         File.Move(tempPath, path, overwrite: true);
+    }
+
+    /// <summary>
+    /// Reads and validates Bloom sidecar (v1 legacy or v2 with CRC).
+    /// </summary>
+    internal static ulong[] ReadWordsOrThrow(string path, int expectedBitCount, int expectedHashCount)
+    {
+        byte[] fileBytes = File.ReadAllBytes(path);
+        if (fileBytes.Length < 20)
+        {
+            throw new InvalidDataException("Bloom sidecar too small for header.");
+        }
+
+        ReadOnlySpan<byte> s = fileBytes;
+        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(s);
+        uint version = BinaryPrimitives.ReadUInt32LittleEndian(s[4..]);
+        int bitCount = BinaryPrimitives.ReadInt32LittleEndian(s[8..]);
+        int hashCount = BinaryPrimitives.ReadInt32LittleEndian(s[12..]);
+        int wordCount = BinaryPrimitives.ReadInt32LittleEndian(s[16..]);
+
+        if (magic != FileMagic
+            || bitCount != expectedBitCount
+            || hashCount != expectedHashCount
+            || wordCount != (expectedBitCount >> 6))
+        {
+            throw new InvalidDataException("Bloom sidecar metadata mismatch.");
+        }
+
+        int v1Payload = 20 + (wordCount * 8);
+        if (version == FileVersionV1)
+        {
+            if (fileBytes.Length != v1Payload)
+            {
+                throw new InvalidDataException("Bloom v1 sidecar size mismatch.");
+            }
+        }
+        else if (version == FileVersionV2)
+        {
+            if (fileBytes.Length != v1Payload + 4)
+            {
+                throw new InvalidDataException("Bloom v2 sidecar size mismatch.");
+            }
+
+            uint expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(s[v1Payload..]);
+            uint actual = Crc32Ieee.Compute(s[..v1Payload]);
+            if (expectedCrc != actual)
+            {
+                throw new InvalidDataException($"Bloom sidecar CRC mismatch (expected {expectedCrc:X8}, actual {actual:X8}).");
+            }
+        }
+        else
+        {
+            throw new InvalidDataException($"Unsupported Bloom sidecar version {version}.");
+        }
+
+        ulong[] words = new ulong[wordCount];
+        int offset = 20;
+        for (int i = 0; i < wordCount; i++)
+        {
+            words[i] = BinaryPrimitives.ReadUInt64LittleEndian(s[offset..]);
+            offset += 8;
+        }
+
+        return words;
     }
 }

@@ -37,9 +37,10 @@ Each shard can have a Bloom sidecar that accelerates `Exists(...)` by skipping s
 
 The public API is intentionally small:
 
-- `HistoryDatabase(...)` (initialization)
-- `bool HistoryLookup(string messageId)`
-- `bool HistoryAdd(string messageId, string serverId)`
+- `HistoryDatabase(...)` (initialization; optional `maxWalkEntries` caps in-memory walk ring)
+- `bool HistoryLookup(string messageId)` — can throw on storage validation or I/O failures (membership is not masked as “false” on fault).
+- `bool HistoryAdd(string messageId, string serverId)` — synchronous wrapper over `HistoryAddAsync`.
+- `Task<bool> HistoryAddAsync(...)` — preferred under load; persists journal line before updating the walk ring after a successful insert.
 - `bool HistoryExpire(string messageId)`
 - `int HistoryExpire(string[] messageIds)`
 - `void HistorySync()`
@@ -75,6 +76,8 @@ HistoryDatabase db = new(
     shardCount: 128,
     slotsPerShard: 1UL << 22,
     maxLoadFactorPercent: 75,
+    maxRetainedGenerations: 8,
+    maxWalkEntries: 1_000_000,
     logger: logger);
 
 bool inserted = db.HistoryAdd("<message-id@host>", "7b136f3d-eeb7-4777-95f4-b9e6eeec40ea");
@@ -101,9 +104,12 @@ flowchart LR
 ## Operational Notes
 
 - **Durability model:** hash state lives in memory-mapped shard files; Bloom sidecars are best-effort accelerators.
+- **Integrity tags:** shard `.dat` headers (v3) store an IEEE CRC-32 over the slot region; Bloom sidecars (v2) append a CRC-32; `expired-md5.bin` uses a versioned envelope with trailing CRC (legacy raw 16-byte records still load). Call `HistorySync()` (or graceful shutdown) so slot CRCs and Bloom files are refreshed after writes.
+- **Unclean shutdown:** if the process dies between slot writes and the next `HistorySync`/shutdown CRC update, the next open may fail with `InvalidDataException` (CRC mismatch) even when payloads are plausible—operational recovery is to restore from backup or resynchronize using a maintenance procedure appropriate to your deployment.
 - **Hashing model:** public `messageId` and `serverId` strings are internally hashed with MD5 and stored as 128-bit values.
-- **Expire model:** expiration is managed explicitly by API calls and applied by lookup/walk logic.
-- **Backpressure:** Bloom checkpoint persistence queue is bounded; drops are logged.
+- **Expire model:** expirations persist to `expired-md5.bin` on each change; `HistorySync()` rewrites the file as well.
+- **Journal:** malformed lines are skipped with a `Trace` warning; successful inserts append with `Flush(true)` on the journal stream.
+- **Backpressure:** Bloom checkpoint queue uses wait-backpressure; if the queue is full, new checkpoint **enqueues are skipped** and logged (older queued checkpoints are not dropped silently).
 - **Logging:** structured logs use `Microsoft.Extensions.Logging` with source-generated `[LoggerMessage]` methods.
 - **Fallback logger:** when no `ILogger` is provided, logging falls back to `System.Diagnostics.Trace`.
 

@@ -20,6 +20,7 @@ internal interface IHistoryWriter : IAsyncDisposable, IDisposable
     /// <summary>
     /// Returns whether the hash exists in any retained generation.
     /// </summary>
+    /// <remarks>Throws when storage is unhealthy or disposed; does not mask errors as non-existence.</remarks>
     bool Exists(ulong hashHi, ulong hashLo);
 
     /// <summary>

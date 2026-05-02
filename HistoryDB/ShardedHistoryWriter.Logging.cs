@@ -19,11 +19,8 @@ internal sealed partial class ShardedHistoryWriter
     [LoggerMessage(EventId = 1003, Level = LogLevel.Debug, Message = "Background slot scrubber started.")]
     private partial void LogSlotScrubberStarted();
 
-    [LoggerMessage(EventId = 1004, Level = LogLevel.Critical, Message = "EnqueueAsync failed unexpectedly. Returning Full to prevent host crash.")]
-    private partial void LogEnqueueFailedCritical(Exception ex);
-
-    [LoggerMessage(EventId = 1005, Level = LogLevel.Error, Message = "Exists failed unexpectedly; returning false for safety.")]
-    private partial void LogExistsFailed(Exception ex);
+    [LoggerMessage(EventId = 1004, Level = LogLevel.Warning, Message = "Bloom checkpoint rejected: persist channel is full (new snapshot not enqueued): {Path}. Increase BloomPersistQueueCapacity or persist frequency; older queued checkpoints remain.")]
+    private partial void LogBloomCheckpointChannelFullRejectingNew(string path);
 
     [LoggerMessage(EventId = 1006, Level = LogLevel.Information, Message = "HistoryDB stop requested.")]
     private partial void LogStopRequested();
@@ -81,7 +78,4 @@ internal sealed partial class ShardedHistoryWriter
 
     [LoggerMessage(EventId = 1024, Level = LogLevel.Critical, Message = "Shard writer loop crashed (generation={GenerationId}, shard={ShardId}). Pending requests are faulted.")]
     private partial void LogShardWriterCrashed(Exception ex, int generationId, int shardId);
-
-    [LoggerMessage(EventId = 1025, Level = LogLevel.Warning, Message = "Bloom checkpoint dropped because persist queue is full: {Path}.")]
-    private partial void LogBloomCheckpointDropped(string path);
 }

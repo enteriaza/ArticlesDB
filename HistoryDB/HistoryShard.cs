@@ -80,7 +80,7 @@ internal unsafe sealed class HistoryShard : IDisposable
 {
     #region Constants
     private const ulong Magic = 0x3130424454534948UL; // "HISTDB01"
-    private const ulong CurrentVersion = 2;
+    private const ulong CurrentVersion = 3;
 
     private const int HeaderSize = 64;
     private const int EntrySize = 32;
@@ -91,6 +91,7 @@ internal unsafe sealed class HistoryShard : IDisposable
     private const int HeaderUsedSlotsOffset = 24;
     private const int HeaderMaxLoadFactorOffset = 32;
     private const int HeaderMaxOccupiedSlotIndexOffset = 40;
+    private const int HeaderSlotRegionCrc32Offset = 48;
     private const ulong ProbeSoftLimit = 64;
     private const ulong SecondaryProbeStart = 16;
     private const ulong LinearProbeWindow = 4;
@@ -110,6 +111,7 @@ internal unsafe sealed class HistoryShard : IDisposable
     private readonly ulong _mask;
     private readonly ulong _maxLoadFactor;
     private readonly ulong _loadLimitSlots;
+    private readonly long _viewByteLength;
     private bool _disposed;
 
     #endregion
@@ -170,6 +172,7 @@ internal unsafe sealed class HistoryShard : IDisposable
         checked
         {
             long fileSize = HeaderSize + (long)tableSize * EntrySize;
+            _viewByteLength = fileSize;
             _mmf = MemoryMappedFile.CreateFromFile(
                 path,
                 FileMode.OpenOrCreate,
@@ -461,6 +464,18 @@ internal unsafe sealed class HistoryShard : IDisposable
     }
 
     /// <summary>
+    /// Recomputes IEEE CRC-32 over the slot region, stores it in the header, and attempts to flush the mapped view.
+    /// </summary>
+    /// <remarks>Call from <see cref="ShardedHistoryWriter.Sync"/> and shutdown paths; not on per-insert hot path.</remarks>
+    public void WriteSlotRegionCrc32AndFlushView()
+    {
+        ThrowIfDisposed();
+        uint crc = ComputeSlotRegionCrc32();
+        WriteUInt32(HeaderSlotRegionCrc32Offset, crc);
+        FlushViewBestEffort();
+    }
+
+    /// <summary>
     /// Reads the hash pair at a slot index if the slot is published (hash_hi non-zero).
     /// </summary>
     /// <param name="index">Slot index in <c>[0, TableSize)</c>.</param>
@@ -720,6 +735,7 @@ internal unsafe sealed class HistoryShard : IDisposable
             WriteUInt64(HeaderUsedSlotsOffset, 0);
             WriteUInt64(HeaderMaxLoadFactorOffset, _maxLoadFactor);
             WriteUInt64(HeaderMaxOccupiedSlotIndexOffset, 0);
+            WriteUInt32(HeaderSlotRegionCrc32Offset, ComputeSlotRegionCrc32());
             return;
         }
 
@@ -739,6 +755,14 @@ internal unsafe sealed class HistoryShard : IDisposable
         {
             WriteUInt64(HeaderVersionOffset, CurrentVersion);
             WriteUInt64(HeaderMaxOccupiedSlotIndexOffset, 0);
+            WriteUInt32(HeaderSlotRegionCrc32Offset, ComputeSlotRegionCrc32());
+            return;
+        }
+
+        if (version == 2)
+        {
+            WriteUInt64(HeaderVersionOffset, CurrentVersion);
+            WriteUInt32(HeaderSlotRegionCrc32Offset, ComputeSlotRegionCrc32());
             return;
         }
 
@@ -752,7 +776,37 @@ internal unsafe sealed class HistoryShard : IDisposable
         {
             throw new InvalidDataException($"Shard maxOccupiedSlotIndex invalid. File={maxOccupied}, TableSize={_tableSize}.");
         }
+
+        uint storedCrc = ReadUInt32(HeaderSlotRegionCrc32Offset);
+        uint actualCrc = ComputeSlotRegionCrc32();
+        if (storedCrc != actualCrc)
+        {
+            throw new InvalidDataException(
+                $"Shard slot-region CRC mismatch (header {storedCrc:X8}, computed {actualCrc:X8}). File may be corrupted.");
+        }
     }
+
+    private uint ComputeSlotRegionCrc32()
+    {
+        long byteLen = checked((long)(_tableSize * (ulong)EntrySize));
+        return Crc32Ieee.ComputeUnmanaged((nint)(_basePtr + HeaderSize), byteLen);
+    }
+
+    private void FlushViewBestEffort()
+    {
+        try
+        {
+            MemoryMappedViewFlush.TryFlush((nint)_basePtr, _viewByteLength);
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceWarning("[HistoryDB] MemoryMappedViewFlush failed: {0}", ex.Message);
+        }
+    }
+
+    private uint ReadUInt32(int offset) => *(uint*)(_basePtr + offset);
+
+    private void WriteUInt32(int offset, uint value) => *(uint*)(_basePtr + offset) = value;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void TryAdvanceMaxOccupiedSlotIndex(ulong slotIndex)

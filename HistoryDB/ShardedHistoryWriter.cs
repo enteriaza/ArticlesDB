@@ -492,21 +492,9 @@ internal sealed partial class ShardedHistoryWriter
     /// </remarks>
     internal ValueTask<ShardInsertResult> EnqueueAsync(ulong hashHi, ulong hashLo, ulong serverHi, ulong serverLo, CancellationToken cancellationToken = default)
     {
-        try
-        {
-            ThrowIfDisposed();
-            EnsureStarted();
-            return AwaitBenchResult(EnqueueWithRolloverAsync(hashHi, hashLo, serverHi, serverLo, captureTiming: false, cancellationToken));
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            LogEnqueueFailedCritical(ex);
-            return ValueTask.FromResult(ShardInsertResult.Full);
-        }
+        ThrowIfDisposed();
+        EnsureStarted();
+        return AwaitBenchResult(EnqueueWithRolloverAsync(hashHi, hashLo, serverHi, serverLo, captureTiming: false, cancellationToken));
     }
 
     /// <summary>
@@ -540,35 +528,31 @@ internal sealed partial class ShardedHistoryWriter
     /// <para>
     /// <b>Thread safety:</b> Safe concurrent with writers; reads do not take the lifecycle lock across shard probes.
     /// </para>
+    /// <para>
+    /// <b>Errors:</b> Storage or fatal conditions propagate to the caller (for example <see cref="ObjectDisposedException"/>,
+    /// <see cref="InvalidDataException"/>, <see cref="IOException"/>).
+    /// </para>
     /// </remarks>
     internal bool Exists(ulong hashHi, ulong hashLo)
     {
-        try
+        ThrowIfDisposed();
+        EnsureStarted();
+
+        int shardId = GetShardId(hashLo);
+        foreach (GenerationState generation in GetGenerationsSnapshotNewestFirst())
         {
-            ThrowIfDisposed();
-            EnsureStarted();
-
-            int shardId = GetShardId(hashLo);
-            foreach (GenerationState generation in GetGenerationsSnapshotNewestFirst())
+            if (generation.BloomShardTrusted[shardId] && !generation.BloomFilters[shardId].MayContain(hashHi, hashLo))
             {
-                if (generation.BloomShardTrusted[shardId] && !generation.BloomFilters[shardId].MayContain(hashHi, hashLo))
-                {
-                    continue;
-                }
-
-                if (generation.Shards[shardId].Exists(hashHi, hashLo))
-                {
-                    return true;
-                }
+                continue;
             }
 
-            return false;
+            if (generation.Shards[shardId].Exists(hashHi, hashLo))
+            {
+                return true;
+            }
         }
-        catch (Exception ex)
-        {
-            LogExistsFailed(ex);
-            return false;
-        }
+
+        return false;
     }
 
     private async ValueTask<ShardInsertBenchmarkResult> EnqueueWithRolloverAsync(
@@ -730,7 +714,10 @@ internal sealed partial class ShardedHistoryWriter
             {
                 try
                 {
-                    generation.Shards[shardId].Dispose();
+                    HistoryShard shard = generation.Shards[shardId];
+                    shard.FlushUsedSlots(shard.UsedSlots);
+                    shard.WriteSlotRegionCrc32AndFlushView();
+                    shard.Dispose();
                 }
                 catch (Exception ex)
                 {
@@ -1172,6 +1159,8 @@ internal sealed partial class ShardedHistoryWriter
 
     private void CreateAndActivateGeneration_NoLock(int generationId)
     {
+        PruneCompletedRetirementTasks_NoLock();
+
         GenerationState generation = CreateGeneration(generationId);
         _generations.Add(generation);
         _activeGenerationId = generationId;
@@ -1183,6 +1172,27 @@ internal sealed partial class ShardedHistoryWriter
             _generations.RemoveAt(0);
             _retiredGenerationCleanupTasks.Add(Task.Run(() => RetireGenerationAsync(retired)));
             LogRetireScheduled(retired.GenerationId);
+        }
+
+        PruneCompletedRetirementTasks_NoLock();
+    }
+
+    private void PruneCompletedRetirementTasks_NoLock()
+    {
+        List<Task> tasks = _retiredGenerationCleanupTasks;
+        int write = 0;
+        for (int read = 0; read < tasks.Count; read++)
+        {
+            Task t = tasks[read];
+            if (!t.IsCompleted)
+            {
+                tasks[write++] = t;
+            }
+        }
+
+        if (write < tasks.Count)
+        {
+            tasks.RemoveRange(write, tasks.Count - write);
         }
     }
 
@@ -1359,7 +1369,9 @@ internal sealed partial class ShardedHistoryWriter
             {
                 for (int shardId = 0; shardId < _shardCount; shardId++)
                 {
-                    generation.Shards[shardId].FlushUsedSlots(generation.Shards[shardId].UsedSlots);
+                    HistoryShard shard = generation.Shards[shardId];
+                    shard.FlushUsedSlots(shard.UsedSlots);
+                    shard.WriteSlotRegionCrc32AndFlushView();
                 }
 
                 PersistGenerationBlooms(generation);
@@ -1488,7 +1500,7 @@ internal sealed partial class ShardedHistoryWriter
                 SingleReader = true,
                 SingleWriter = false,
                 AllowSynchronousContinuations = false,
-                FullMode = BoundedChannelFullMode.DropOldest
+                FullMode = BoundedChannelFullMode.Wait
             });
             _bloomPersistTask = Task.Run(() => RunBloomPersistLoopAsync(_bloomPersistChannel.Reader, _stopCts.Token));
         }
@@ -1549,7 +1561,7 @@ internal sealed partial class ShardedHistoryWriter
 
         if (!writer.TryWrite(new BloomPersistWork(path, words, filter.BitCount, filter.HashFunctionCount)))
         {
-            LogBloomCheckpointDropped(path);
+            LogBloomCheckpointChannelFullRejectingNew(path);
         }
     }
 
@@ -1783,7 +1795,10 @@ internal sealed partial class ShardedHistoryWriter
         {
             try
             {
-                generation.Shards[shardId].Dispose();
+                HistoryShard shard = generation.Shards[shardId];
+                shard.FlushUsedSlots(shard.UsedSlots);
+                shard.WriteSlotRegionCrc32AndFlushView();
+                shard.Dispose();
             }
             catch (Exception ex)
             {
@@ -1872,28 +1887,9 @@ internal sealed partial class ShardedHistoryWriter
 
         public static BloomFilter64 LoadFromFile(string path, int expectedBitCount, int expectedHashCount)
         {
-            using FileStream stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-            using BinaryReader reader = new(stream);
-
-            uint magic = reader.ReadUInt32();
-            uint version = reader.ReadUInt32();
-            int bitCount = reader.ReadInt32();
-            int hashCount = reader.ReadInt32();
-            int wordCount = reader.ReadInt32();
-
-            if (magic != BloomSidecarFile.FileMagic || version != BloomSidecarFile.FileVersion ||
-                bitCount != expectedBitCount || hashCount != expectedHashCount ||
-                wordCount != (expectedBitCount >> 6))
-            {
-                throw new InvalidDataException("Bloom sidecar metadata mismatch.");
-            }
-
-            BloomFilter64 filter = new(bitCount, hashCount);
-            for (int i = 0; i < wordCount; i++)
-            {
-                filter._words[i] = reader.ReadUInt64();
-            }
-
+            ulong[] words = BloomSidecarFile.ReadWordsOrThrow(path, expectedBitCount, expectedHashCount);
+            BloomFilter64 filter = new(expectedBitCount, expectedHashCount);
+            words.AsSpan().CopyTo(filter._words);
             return filter;
         }
 
