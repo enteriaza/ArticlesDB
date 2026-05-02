@@ -7,11 +7,11 @@ internal interface IMessageHashProvider
     Hash128 ComputeHash(string text);
 }
 
-internal interface IHistoryMetadataStore
+internal interface IHistoryMetadataStore : IAsyncDisposable
 {
     bool IsExpired(Hash128 messageHash);
 
-    void RecordInserted(string messageId, string serverId, Hash128 messageHash, DateTimeOffset createdAtUtc);
+    void RecordInserted(string messageId, string serverId, Hash128 messageHash, DateTimeOffset createdAtUtc, bool persistJournalAndWalk = true);
 
     bool Expire(Hash128 messageHash);
 
@@ -20,6 +20,10 @@ internal interface IHistoryMetadataStore
     void PersistExpiredSet();
 
     int Walk(ref long position, out HistoryWalkEntry entry);
+
+    long GetEvictedWalkEntryCount();
+
+    ValueTask FlushJournalAsync(CancellationToken cancellationToken = default);
 }
 
 internal readonly record struct Hash128(ulong Hi, ulong Lo);

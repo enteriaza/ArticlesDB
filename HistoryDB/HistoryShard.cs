@@ -1,9 +1,11 @@
-// HistoryShard.cs -- memory-mapped 128-bit hash table shard with linear-then-secondary probing, optional SSE2 slot compares, and header v2 with MaxOccupiedSlotIndex watermark.
+// HistoryShard.cs -- memory-mapped 128-bit hash table shard with linear-then-secondary probing, optional SSE2 slot compares, header v3 with MaxOccupiedSlotIndex watermark and payload CRC-32 (refreshed on flush).
 // Hash visibility uses hash_hi as the published flag (written last). Consumed by ShardedHistoryWriter per generation shard file. SSE2 is used when supported (typical Windows/Linux x64); otherwise scalar compares apply.
 
 using System;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Hashing;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
@@ -60,7 +62,7 @@ internal readonly record struct ShardInsertBenchmarkResult(
     long WriterExecutionTicks);
 
 /// <summary>
-/// One generation shard: fixed-size open addressing table stored in a memory-mapped file with a small binary header.
+/// One generation shard: fixed-size open addressing table stored in a memory-mapped file with a small binary header (including IEEE CRC-32 of slot payload bytes).
 /// </summary>
 /// <remarks>
 /// <para>
@@ -80,7 +82,7 @@ internal unsafe sealed class HistoryShard : IDisposable
 {
     #region Constants
     private const ulong Magic = 0x3130424454534948UL; // "HISTDB01"
-    private const ulong CurrentVersion = 2;
+    private const ulong CurrentVersion = 3;
 
     private const int HeaderSize = 64;
     private const int EntrySize = 32;
@@ -91,6 +93,7 @@ internal unsafe sealed class HistoryShard : IDisposable
     private const int HeaderUsedSlotsOffset = 24;
     private const int HeaderMaxLoadFactorOffset = 32;
     private const int HeaderMaxOccupiedSlotIndexOffset = 40;
+    private const int HeaderPayloadCrc32Offset = 48;
     private const ulong ProbeSoftLimit = 64;
     private const ulong SecondaryProbeStart = 16;
     private const ulong LinearProbeWindow = 4;
@@ -133,6 +136,14 @@ internal unsafe sealed class HistoryShard : IDisposable
     /// <summary>Highest slot index known to contain a published entry; used to bound warm-up scans.</summary>
     /// <remarks><para>Header v2 field; upgraded from v1 files on open.</para></remarks>
     public ulong MaxOccupiedSlotIndex => ReadUInt64(HeaderMaxOccupiedSlotIndexOffset);
+
+    /// <summary>
+    /// IEEE CRC-32 over slot bytes (header size .. EOF), last updated by <see cref="RefreshPayloadCrc32"/> at quiesce points (sync, shutdown, dispose).
+    /// </summary>
+    /// <remarks>
+    /// Slots may change between CRC refreshes; use this field for offline integrity checks after quiescing writes, not as a strict snapshot invariant while inserts are in flight.
+    /// </remarks>
+    public uint PayloadCrc32 => ReadPayloadCrc32();
 
     #endregion
 
@@ -461,6 +472,15 @@ internal unsafe sealed class HistoryShard : IDisposable
     }
 
     /// <summary>
+    /// Recomputes and persists the IEEE CRC-32 over all slot bytes. Call after quiescing writers or from <see cref="Dispose"/> / administrative sync paths.
+    /// </summary>
+    public void RefreshPayloadCrc32()
+    {
+        ThrowIfDisposed();
+        WritePayloadCrc32(ComputePayloadCrc32());
+    }
+
+    /// <summary>
     /// Reads the hash pair at a slot index if the slot is published (hash_hi non-zero).
     /// </summary>
     /// <param name="index">Slot index in <c>[0, TableSize)</c>.</param>
@@ -555,6 +575,15 @@ internal unsafe sealed class HistoryShard : IDisposable
 
         try
         {
+            RefreshPayloadCrc32();
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceWarning("[HistoryDB] HistoryShard RefreshPayloadCrc32 failed: {0}", ex.Message);
+        }
+
+        try
+        {
             _accessor.SafeMemoryMappedViewHandle.ReleasePointer();
         }
         catch (Exception ex)
@@ -599,6 +628,31 @@ internal unsafe sealed class HistoryShard : IDisposable
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void WriteUInt64(int offset, ulong value) => *(ulong*)(_basePtr + offset) = value;
+
+    private uint ComputePayloadCrc32()
+    {
+        var crc = new Crc32();
+        byte* p = _basePtr + HeaderSize;
+        ulong remaining = _tableSize * (ulong)EntrySize;
+        ulong offset = 0;
+        while (remaining > 0)
+        {
+            int chunk = remaining > int.MaxValue ? int.MaxValue : (int)remaining;
+            crc.Append(new ReadOnlySpan<byte>(p + offset, chunk));
+            offset += (ulong)chunk;
+            remaining -= (ulong)chunk;
+        }
+
+        return crc.GetCurrentHashAsUInt32();
+    }
+
+    private void WritePayloadCrc32(uint crc)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(new Span<byte>(_basePtr + HeaderPayloadCrc32Offset, sizeof(uint)), crc);
+    }
+
+    private uint ReadPayloadCrc32() =>
+        BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(_basePtr + HeaderPayloadCrc32Offset, sizeof(uint)));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void NormalizeZeroHash(ulong hashHi, ref ulong hashLo)
@@ -720,6 +774,7 @@ internal unsafe sealed class HistoryShard : IDisposable
             WriteUInt64(HeaderUsedSlotsOffset, 0);
             WriteUInt64(HeaderMaxLoadFactorOffset, _maxLoadFactor);
             WriteUInt64(HeaderMaxOccupiedSlotIndexOffset, 0);
+            WritePayloadCrc32(ComputePayloadCrc32());
             return;
         }
 
@@ -737,8 +792,15 @@ internal unsafe sealed class HistoryShard : IDisposable
 
         if (version == 1)
         {
-            WriteUInt64(HeaderVersionOffset, CurrentVersion);
             WriteUInt64(HeaderMaxOccupiedSlotIndexOffset, 0);
+            WriteUInt64(HeaderVersionOffset, 2);
+            version = 2;
+        }
+
+        if (version == 2)
+        {
+            WritePayloadCrc32(ComputePayloadCrc32());
+            WriteUInt64(HeaderVersionOffset, CurrentVersion);
             return;
         }
 
@@ -752,6 +814,8 @@ internal unsafe sealed class HistoryShard : IDisposable
         {
             throw new InvalidDataException($"Shard maxOccupiedSlotIndex invalid. File={maxOccupied}, TableSize={_tableSize}.");
         }
+
+        // Payload CRC-32 is recomputed on RefreshPayloadCrc32 / quiesce; do not verify here because mmap slots may advance ahead of the last refresh.
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

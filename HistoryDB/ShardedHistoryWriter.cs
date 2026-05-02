@@ -7,6 +7,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Threading.Tasks.Sources;
@@ -106,6 +108,10 @@ internal sealed partial class ShardedHistoryWriter
     private Task? _stopTask;
     private Task? _slotScrubTask;
     private readonly ConcurrentDictionary<(int GenerationId, int ShardId), byte> _bloomRewarmInFlight = new();
+    private readonly ConcurrentBag<Task> _bloomRewarmTasks = new();
+
+    private volatile GenerationState[]? _generationsSnapshotNewestFirst;
+    private int _generationsVersion;
 
     private long _scrubSamplesTotal;
     private long _scrubVolatileMismatches;
@@ -505,7 +511,7 @@ internal sealed partial class ShardedHistoryWriter
         catch (Exception ex)
         {
             LogEnqueueFailedCritical(ex);
-            return ValueTask.FromResult(ShardInsertResult.Full);
+            throw;
         }
     }
 
@@ -543,13 +549,15 @@ internal sealed partial class ShardedHistoryWriter
     /// </remarks>
     internal bool Exists(ulong hashHi, ulong hashLo)
     {
-        try
-        {
-            ThrowIfDisposed();
-            EnsureStarted();
+        ThrowIfDisposed();
+        EnsureStarted();
 
-            int shardId = GetShardId(hashLo);
-            foreach (GenerationState generation in GetGenerationsSnapshotNewestFirst())
+        int shardId = GetShardId(hashLo);
+        while (true)
+        {
+            int versionStart = Volatile.Read(ref _generationsVersion);
+            GenerationState[] generations = GetGenerationsSnapshotNewestFirst();
+            foreach (GenerationState generation in generations)
             {
                 if (generation.BloomShardTrusted[shardId] && !generation.BloomFilters[shardId].MayContain(hashHi, hashLo))
                 {
@@ -562,12 +570,10 @@ internal sealed partial class ShardedHistoryWriter
                 }
             }
 
-            return false;
-        }
-        catch (Exception ex)
-        {
-            LogExistsFailed(ex);
-            return false;
+            if (Volatile.Read(ref _generationsVersion) == versionStart)
+            {
+                return false;
+            }
         }
     }
 
@@ -719,6 +725,18 @@ internal sealed partial class ShardedHistoryWriter
         catch (Exception ex)
         {
             LogShutdownWaitFailed(ex);
+        }
+
+        while (_bloomRewarmTasks.TryTake(out Task? rewarmTask))
+        {
+            try
+            {
+                await rewarmTask.ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                LogShutdownWaitFailed(ex);
+            }
         }
 
         await CompleteBloomPersistAsync().ConfigureAwait(false);
@@ -1146,7 +1164,7 @@ internal sealed partial class ShardedHistoryWriter
         }
 
         GenerationState capturedGeneration = generation;
-        _ = Task.Run(async () =>
+        Task rewarmTask = Task.Run(async () =>
         {
             try
             {
@@ -1168,6 +1186,7 @@ internal sealed partial class ShardedHistoryWriter
                 _bloomRewarmInFlight.TryRemove(key, out _);
             }
         });
+        _bloomRewarmTasks.Add(rewarmTask);
     }
 
     private void CreateAndActivateGeneration_NoLock(int generationId)
@@ -1188,6 +1207,8 @@ internal sealed partial class ShardedHistoryWriter
             _retiredGenerationCleanupTasks.Add(Task.Run(() => RetireGenerationAsync(retired)));
             LogRetireScheduled(retired.GenerationId);
         }
+
+        RebuildGenerationsSnapshot_NoLock();
     }
 
     private void PruneCompletedRetiredCleanupTasks_NoLock()
@@ -1335,12 +1356,37 @@ internal sealed partial class ShardedHistoryWriter
 
     private GenerationState[] GetGenerationsSnapshotNewestFirst()
     {
+        GenerationState[]? cached = _generationsSnapshotNewestFirst;
+        if (cached is not null)
+        {
+            return cached;
+        }
+
         lock (_lifecycleLock)
         {
-            GenerationState[] snapshot = [.. _generations];
-            Array.Reverse(snapshot);
-            return snapshot;
+            return _generationsSnapshotNewestFirst ?? RebuildGenerationsSnapshot_NoLock();
         }
+    }
+
+    private GenerationState[] RebuildGenerationsSnapshot_NoLock()
+    {
+        int count = _generations.Count;
+        if (count == 0)
+        {
+            GenerationState[] empty = [];
+            _generationsSnapshotNewestFirst = empty;
+            return empty;
+        }
+
+        GenerationState[] snapshot = new GenerationState[count];
+        for (int i = 0; i < count; i++)
+        {
+            snapshot[i] = _generations[count - 1 - i];
+        }
+
+        _generationsSnapshotNewestFirst = snapshot;
+        Interlocked.Increment(ref _generationsVersion);
+        return snapshot;
     }
 
     private int GetShardId(ulong hashLo) => (int)(hashLo % (ulong)_shardCount);
@@ -1394,6 +1440,7 @@ internal sealed partial class ShardedHistoryWriter
                 for (int shardId = 0; shardId < _shardCount; shardId++)
                 {
                     generation.Shards[shardId].FlushUsedSlots(generation.Shards[shardId].UsedSlots);
+                    generation.Shards[shardId].RefreshPayloadCrc32();
                 }
 
                 PersistGenerationBlooms(generation);
@@ -1469,15 +1516,7 @@ internal sealed partial class ShardedHistoryWriter
             return;
         }
 
-        Task task = vt.AsTask();
-        if (SynchronizationContext.Current is not null)
-        {
-            Task.Run(() => task.ConfigureAwait(false).GetAwaiter().GetResult()).GetAwaiter().GetResult();
-        }
-        else
-        {
-            task.ConfigureAwait(false).GetAwaiter().GetResult();
-        }
+        vt.AsTask().ConfigureAwait(false).GetAwaiter().GetResult();
     }
 
     private ShardCompletionSource RentCompletion()
@@ -1522,7 +1561,7 @@ internal sealed partial class ShardedHistoryWriter
                 SingleReader = true,
                 SingleWriter = false,
                 AllowSynchronousContinuations = false,
-                FullMode = BoundedChannelFullMode.DropOldest
+                FullMode = BoundedChannelFullMode.Wait
             });
             _bloomPersistTask = Task.Run(() => RunBloomPersistLoopAsync(_bloomPersistChannel.Reader, _stopCts.Token));
         }
@@ -1581,10 +1620,10 @@ internal sealed partial class ShardedHistoryWriter
             return;
         }
 
-        if (!writer.TryWrite(new BloomPersistWork(path, words, filter.BitCount, filter.HashFunctionCount)))
-        {
-            LogBloomCheckpointDropped(path);
-        }
+        writer.WriteAsync(new BloomPersistWork(path, words, filter.BitCount, filter.HashFunctionCount), _stopCts.Token)
+            .AsTask()
+            .GetAwaiter()
+            .GetResult();
     }
 
     private async Task CompleteBloomPersistAsync()
@@ -1915,17 +1954,55 @@ internal sealed partial class ShardedHistoryWriter
             int hashCount = reader.ReadInt32();
             int wordCount = reader.ReadInt32();
 
-            if (magic != BloomSidecarFile.FileMagic || version != BloomSidecarFile.FileVersion ||
+            if (magic != BloomSidecarFile.FileMagic ||
+                (version != BloomSidecarFile.LegacyFileVersion && version != BloomSidecarFile.FileVersion) ||
                 bitCount != expectedBitCount || hashCount != expectedHashCount ||
                 wordCount != (expectedBitCount >> 6))
             {
                 throw new InvalidDataException("Bloom sidecar metadata mismatch.");
             }
 
+            long streamLength = stream.Length;
+            long headerBytes = sizeof(uint) * 2 + sizeof(int) * 3;
+            long wordsBytes = (long)wordCount * sizeof(ulong);
+            long expectedLengthV1 = headerBytes + wordsBytes;
+            long expectedLengthV2 = expectedLengthV1 + sizeof(uint);
+            if (version == BloomSidecarFile.LegacyFileVersion && streamLength != expectedLengthV1)
+            {
+                throw new InvalidDataException("Bloom sidecar length does not match legacy (version 1) layout.");
+            }
+
+            if (version == BloomSidecarFile.FileVersion && streamLength != expectedLengthV2)
+            {
+                throw new InvalidDataException("Bloom sidecar length does not match checksum (version 2) layout.");
+            }
+
+            var crc = new Crc32();
+            Span<byte> headerSpan = stackalloc byte[24];
+            BinaryPrimitives.WriteUInt32LittleEndian(headerSpan, magic);
+            BinaryPrimitives.WriteUInt32LittleEndian(headerSpan.Slice(4), version);
+            BinaryPrimitives.WriteInt32LittleEndian(headerSpan.Slice(8), bitCount);
+            BinaryPrimitives.WriteInt32LittleEndian(headerSpan.Slice(12), hashCount);
+            BinaryPrimitives.WriteInt32LittleEndian(headerSpan.Slice(16), wordCount);
+            crc.Append(headerSpan);
+
             BloomFilter64 filter = new(bitCount, hashCount);
+            Span<byte> wordSpan = stackalloc byte[sizeof(ulong)];
             for (int i = 0; i < wordCount; i++)
             {
-                filter._words[i] = reader.ReadUInt64();
+                ulong w = reader.ReadUInt64();
+                filter._words[i] = w;
+                BinaryPrimitives.WriteUInt64LittleEndian(wordSpan, w);
+                crc.Append(wordSpan);
+            }
+
+            if (version == BloomSidecarFile.FileVersion)
+            {
+                uint storedCrc = reader.ReadUInt32();
+                if (storedCrc != crc.GetCurrentHashAsUInt32())
+                {
+                    throw new InvalidDataException("Bloom sidecar CRC32 mismatch.");
+                }
             }
 
             return filter;
@@ -1966,15 +2043,25 @@ internal sealed partial class ShardedHistoryWriter
             ulong h1 = Mix(hashLo);
             ulong h2 = Mix(hashHi ^ 0x9E3779B97F4A7C15UL) | 1UL;
 
-            lock (this)
+            for (int i = 0; i < _hashCount; i++)
             {
-                for (int i = 0; i < _hashCount; i++)
+                ulong combined = h1 + ((ulong)i * h2);
+                int bitIndex = (int)(combined & (uint)_bitMask);
+                int wordIndex = bitIndex >> 6;
+                ulong bit = 1UL << (bitIndex & 63);
+                OrBitsIntoWord(ref _words[wordIndex], bit);
+            }
+        }
+
+        private static void OrBitsIntoWord(ref ulong word, ulong bits)
+        {
+            while (true)
+            {
+                ulong observed = Volatile.Read(ref word);
+                ulong merged = observed | bits;
+                if (merged == observed || Interlocked.CompareExchange(ref word, merged, observed) == observed)
                 {
-                    ulong combined = h1 + ((ulong)i * h2);
-                    int bitIndex = (int)(combined & (uint)_bitMask);
-                    int wordIndex = bitIndex >> 6;
-                    ulong bit = 1UL << (bitIndex & 63);
-                    _words[wordIndex] |= bit;
+                    return;
                 }
             }
         }

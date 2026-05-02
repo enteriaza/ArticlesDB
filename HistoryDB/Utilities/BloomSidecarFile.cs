@@ -1,7 +1,9 @@
 // BloomSidecarFile.cs -- binary layout and atomic write for per-shard Bloom filter sidecars (.bloom) shared by load and save paths.
 // Uses temp file plus replace to avoid torn reads; callers supply word buffers matching bitCount / hashCount metadata.
 
+using System.Buffers.Binary;
 using System.IO;
+using System.IO.Hashing;
 
 namespace HistoryDB.Utilities;
 
@@ -11,6 +13,7 @@ namespace HistoryDB.Utilities;
 /// <remarks>
 /// <para>
 /// <b>On-disk layout:</b> <c>uint magic</c>, <c>uint version</c>, <c>int bitCount</c>, <c>int hashCount</c>, <c>int wordCount</c>, then <c>wordCount</c> little-endian <see cref="ulong"/> values.
+/// Version 2 appends <c>uint crc32</c> (IEEE 802.3) over all preceding bytes (everything before the CRC field).
 /// </para>
 /// <para>
 /// <b>Thread safety:</b> <see cref="WriteSidecar(string, ulong[], int, int)"/> must not be invoked concurrently for the same <paramref name="path"/>; concurrent writes to different paths are supported by the OS.
@@ -24,9 +27,14 @@ internal static class BloomSidecarFile
     internal const uint FileMagic = 0x4D4F4F4C;
 
     /// <summary>
-    /// Current on-disk format version for <see cref="FileMagic"/>.
+    /// Current on-disk format version for <see cref="FileMagic"/> (includes trailing CRC-32).
     /// </summary>
-    internal const uint FileVersion = 1;
+    internal const uint FileVersion = 2;
+
+    /// <summary>
+    /// Legacy format version without a checksum suffix (still accepted on load).
+    /// </summary>
+    internal const uint LegacyFileVersion = 1;
 
     /// <summary>
     /// Writes a Bloom sidecar atomically (temp file, flush, move) so readers never observe a partial file.
@@ -55,8 +63,8 @@ internal static class BloomSidecarFile
         Directory.CreateDirectory(directory);
         string tempPath = path + ".tmp";
 
-        using (FileStream stream = File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
-        using (BinaryWriter writer = new(stream))
+        using MemoryStream memory = new(checked(24 + (wordCount * sizeof(ulong)) + sizeof(uint)));
+        using (BinaryWriter writer = new(memory, System.Text.Encoding.UTF8, leaveOpen: true))
         {
             writer.Write(FileMagic);
             writer.Write(FileVersion);
@@ -69,6 +77,17 @@ internal static class BloomSidecarFile
             }
 
             writer.Flush();
+        }
+
+        ReadOnlySpan<byte> serializedPayload = memory.GetBuffer().AsSpan(0, checked((int)memory.Length));
+        uint crc = Crc32.HashToUInt32(serializedPayload);
+
+        using (FileStream stream = File.Open(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            stream.Write(serializedPayload);
+            Span<byte> crcBytes = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(crcBytes, crc);
+            stream.Write(crcBytes);
             stream.Flush(flushToDisk: true);
         }
 

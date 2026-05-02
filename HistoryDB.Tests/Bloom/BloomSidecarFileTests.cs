@@ -37,6 +37,30 @@ public sealed class BloomSidecarFileTests : IClassFixture<TestHostFixture>
     }
 
     [Fact]
+    public async Task WriteSidecar_RejectsTamperedCrcAsync()
+    {
+        using ITemporaryDirectoryWorkspace workspace = _host.WorkspaceFactory.Create(_host.LayoutOptions.BloomSidecarPurposeFolderName);
+        string path = workspace.Combine("shard-corrupt.bloom");
+
+        const int bitCount = 64;
+        const int hashCount = 7;
+        ulong[] words = [0x0123456789ABCDEFUL];
+
+        BloomSidecarFile.WriteSidecar(path, words, bitCount, hashCount);
+
+        byte[] raw = await File.ReadAllBytesAsync(path);
+        raw[^1] ^= 0xFF;
+        await File.WriteAllBytesAsync(path, raw);
+
+        InvalidDataException exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            _host.BloomSidecarReader.ReadAsync(path, CancellationToken.None));
+
+        Assert.True(
+            exception.Message.Contains("CRC32", StringComparison.Ordinal) ||
+            exception.Message.Contains("checksum", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void WriteSidecar_RejectsWordBufferLengthMismatch()
     {
         using ITemporaryDirectoryWorkspace workspace = _host.WorkspaceFactory.Create(_host.LayoutOptions.BloomSidecarPurposeFolderName);

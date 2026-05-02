@@ -1,6 +1,8 @@
 using System.Buffers.Binary;
+using System.IO.Hashing;
 using HistoryDB.Tests.Infrastructure.Contracts;
 using HistoryDB.Tests.Infrastructure.Contracts.Dtos;
+using HistoryDB.Utilities;
 using Microsoft.Extensions.Logging;
 
 namespace HistoryDB.Tests.Infrastructure.Bloom;
@@ -52,22 +54,53 @@ internal sealed class BloomSidecarFormatReader : IBloomSidecarFormatReader
         int wordCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, sizeof(int)));
         offset += sizeof(int);
 
+        if (magic != BloomSidecarFile.FileMagic)
+        {
+            throw new InvalidDataException("Bloom sidecar magic mismatch.");
+        }
+
+        if (version != BloomSidecarFile.LegacyFileVersion && version != BloomSidecarFile.FileVersion)
+        {
+            throw new InvalidDataException($"Bloom sidecar version {version} is not supported.");
+        }
+
         if (wordCount < 0)
         {
             throw new InvalidDataException("Bloom sidecar reported a negative word count.");
         }
 
-        long payloadBytes = (long)wordCount * sizeof(ulong);
-        if (payloadBytes > span.Length - offset)
+        int wordsByteLength = wordCount * sizeof(ulong);
+        int offsetAfterWords = offset + wordsByteLength;
+        if (offsetAfterWords > span.Length)
         {
             throw new InvalidDataException("Bloom sidecar word payload length is inconsistent with the buffer.");
         }
 
+        if (version == BloomSidecarFile.LegacyFileVersion && span.Length != offsetAfterWords)
+        {
+            throw new InvalidDataException("Bloom legacy sidecar has trailing bytes.");
+        }
+
+        if (version == BloomSidecarFile.FileVersion && span.Length != offsetAfterWords + sizeof(uint))
+        {
+            throw new InvalidDataException("Bloom sidecar with checksum has unexpected length.");
+        }
+
+        ReadOnlySpan<byte> wordsSpan = span.Slice(offset, wordsByteLength);
         ulong[] words = wordCount == 0 ? Array.Empty<ulong>() : new ulong[wordCount];
-        ReadOnlySpan<byte> wordsSpan = span.Slice(offset, wordCount * sizeof(ulong));
         for (int i = 0; i < wordCount; i++)
         {
             words[i] = BinaryPrimitives.ReadUInt64LittleEndian(wordsSpan.Slice(i * sizeof(ulong), sizeof(ulong)));
+        }
+
+        if (version == BloomSidecarFile.FileVersion)
+        {
+            uint storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(offsetAfterWords, sizeof(uint)));
+            uint computed = Crc32.HashToUInt32(span.Slice(0, offsetAfterWords));
+            if (storedCrc != computed)
+            {
+                throw new InvalidDataException("Bloom sidecar CRC32 mismatch.");
+            }
         }
 
         return new BloomSidecarPayload(magic, version, bitCount, hashCount, words);

@@ -535,7 +535,7 @@ internal sealed partial class BenchmarkOrchestrator : IBenchmarkOrchestrator
         for (int i = 0; i < workers; i++)
         {
             int localWorker = i;
-            tasks[i] = Task.Run(() => action(localWorker));
+            tasks[i] = action(localWorker);
         }
 
         await Task.WhenAll(tasks).ConfigureAwait(false);
