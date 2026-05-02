@@ -78,6 +78,9 @@ internal sealed partial class ShardedHistoryWriter
     private readonly ulong _configuredBloomMemoryBudgetBytes;
     private ulong _bloomCheckpointInsertInterval;
     private readonly ulong _bloomCheckpointMaxSnapshotBytes;
+    private BloomCheckpointPersistMode _bloomCheckpointPersistMode;
+    private HistoryCrossGenerationDuplicateCheck _crossGenerationDuplicateCheck;
+    private long _bloomCheckpointDropped;
     /// <summary>Per-shard slot count at or above which writers request the next generation (0 disables load-based proactive rollover).</summary>
     private ulong _proactiveRolloverUsedSlotsThreshold;
     /// <summary>Bounded channel items at or above which enqueue requests the next generation (0 disables queue-based proactive rollover).</summary>
@@ -122,6 +125,12 @@ internal sealed partial class ShardedHistoryWriter
     private bool _disposed;
     private int _activeGenerationId;
     private int _disposeOnce;
+
+    /// <summary>Max single-queue items drained and processed per writer burst ceiling (1 = legacy one-at-a-time).</summary>
+    private int _writerCoalesceMax = 1;
+
+    /// <summary>When non-zero and <see cref="_writerCoalesceMax"/> is greater than 1, each shard writer adjusts its effective burst size between 1 and the ceiling.</summary>
+    private int _writerCoalesceAdaptive = 1;
 
     #endregion
 
@@ -171,6 +180,8 @@ internal sealed partial class ShardedHistoryWriter
     /// <param name="bloomWarmupLogicalProcessor">Logical processor index for warm-up (negative means last processor).</param>
     /// <param name="pinSlotScrubberThread">Pins the slot scrubber thread.</param>
     /// <param name="slotScrubberLogicalProcessor">Logical processor index for scrubber (negative means last processor).</param>
+    /// <param name="bloomCheckpointPersistMode">Bloom checkpoint channel behavior under load.</param>
+    /// <param name="crossGenerationDuplicateCheck">Whether to scan older generations before enqueue.</param>
     public ShardedHistoryWriter(
         string rootPath,
         int shardCount = 128,
@@ -199,6 +210,8 @@ internal sealed partial class ShardedHistoryWriter
         int bloomWarmupLogicalProcessor = -1,
         bool pinSlotScrubberThread = false,
         int slotScrubberLogicalProcessor = -1,
+        BloomCheckpointPersistMode bloomCheckpointPersistMode = BloomCheckpointPersistMode.Throughput,
+        HistoryCrossGenerationDuplicateCheck crossGenerationDuplicateCheck = HistoryCrossGenerationDuplicateCheck.Full,
         ILogger? logger = null)
     {
         _logger = logger ?? TraceFallbackLogger.Instance;
@@ -293,6 +306,8 @@ internal sealed partial class ShardedHistoryWriter
         _configuredBloomMemoryBudgetBytes = bloomMemoryBudgetBytes;
         _bloomCheckpointInsertInterval = bloomCheckpointInsertInterval;
         _bloomCheckpointMaxSnapshotBytes = bloomCheckpointMaxSnapshotBytes;
+        _bloomCheckpointPersistMode = bloomCheckpointPersistMode;
+        _crossGenerationDuplicateCheck = crossGenerationDuplicateCheck;
         _proactiveRolloverUsedSlotsThreshold = RolloverPolicy.ComputeUsedSlotsThreshold(slotsPerShard, proactiveRolloverLoadFactorPercent);
         _proactiveRolloverQueueDepthThreshold = RolloverPolicy.ComputeQueueDepthThreshold(queueCapacityPerShard, proactiveRolloverQueueWatermarkPercent);
         _proactiveRolloverAggregateProbeFailuresThreshold = proactiveRolloverAggregateProbeFailuresThreshold;
@@ -343,6 +358,8 @@ internal sealed partial class ShardedHistoryWriter
             bloomWarmupLogicalProcessor: options.Affinity.BloomWarmupLogicalProcessor,
             pinSlotScrubberThread: options.Affinity.PinSlotScrubberThread,
             slotScrubberLogicalProcessor: options.Affinity.SlotScrubberLogicalProcessor,
+            bloomCheckpointPersistMode: options.Bloom.CheckpointPersistMode,
+            crossGenerationDuplicateCheck: options.CrossGenerationDuplicateCheck,
             logger: logger)
     {
     }
@@ -591,7 +608,8 @@ internal sealed partial class ShardedHistoryWriter
         {
             GenerationState generation = GetActiveGeneration();
 
-            if (ExistsInGenerationsBeforeOrEqual(generation.GenerationId, shardId, hashHi, hashLo))
+            if (_crossGenerationDuplicateCheck == HistoryCrossGenerationDuplicateCheck.Full &&
+                ExistsInGenerationsBeforeOrEqual(generation.GenerationId, shardId, hashHi, hashLo))
             {
                 return new ShardInsertBenchmarkResult(ShardInsertResult.Duplicate, 0, 0);
             }
@@ -614,7 +632,7 @@ internal sealed partial class ShardedHistoryWriter
                             request = request with { ChannelWriteStartTicks = Stopwatch.GetTimestamp() };
                         }
 
-                        await generation.Queues[shardId].Writer.WriteAsync(request, cancellationToken).ConfigureAwait(false);
+                        await generation.Queues[shardId].Writer.WriteAsync(ShardWriteQueueItem.OfSingle(request), cancellationToken).ConfigureAwait(false);
                     }
                     catch
                     {
@@ -649,6 +667,141 @@ internal sealed partial class ShardedHistoryWriter
         }
 
         return new ShardInsertBenchmarkResult(ShardInsertResult.Full, 0, 0);
+    }
+
+    internal int ShardCount => _shardCount;
+
+    /// <summary>
+    /// Sets the ceiling on how many <see cref="ShardWriteQueueKind.Single"/> items a shard writer may dequeue and apply in one burst (1..<see cref="HistoryDatabase.MaxHistoryAddBatch"/>).
+    /// When <see cref="SetWriterCoalesceAdaptive"/> is enabled and the ceiling is greater than 1, the effective burst size is tuned per shard up to this maximum.
+    /// Enqueue, dedupe, and hashing stay per-request; only mmap/Bloom work is amortized inside the writer loop.
+    /// </summary>
+    internal void SetWriterCoalesceMax(int maxPerBurst)
+    {
+        if (maxPerBurst < 1)
+        {
+            maxPerBurst = 1;
+        }
+        else if (maxPerBurst > HistoryDatabase.MaxHistoryAddBatch)
+        {
+            maxPerBurst = HistoryDatabase.MaxHistoryAddBatch;
+        }
+
+        Volatile.Write(ref _writerCoalesceMax, maxPerBurst);
+    }
+
+    /// <summary>
+    /// When <see langword="true"/> (default) and the coalesce ceiling is greater than 1, each shard writer adaptively tunes its effective burst size.
+    /// When <see langword="false"/>, the effective burst size stays equal to the ceiling from <see cref="SetWriterCoalesceMax"/>.
+    /// </summary>
+    internal void SetWriterCoalesceAdaptive(bool enabled) =>
+        Volatile.Write(ref _writerCoalesceAdaptive, enabled ? 1 : 0);
+
+    internal bool IsDuplicateBeforeEnqueue(ulong hashHi, ulong hashLo)
+    {
+        if (_crossGenerationDuplicateCheck != HistoryCrossGenerationDuplicateCheck.Full)
+        {
+            return false;
+        }
+
+        GenerationState generation = GetActiveGeneration();
+        int shardId = GetShardId(hashLo);
+        return ExistsInGenerationsBeforeOrEqual(generation.GenerationId, shardId, hashHi, hashLo);
+    }
+
+    /// <summary>
+    /// Enqueues up to 128 pre-hashed rows for one shard in a single channel message; retries the whole batch on full/probe-limit like single inserts.
+    /// </summary>
+    internal async Task EnqueuePrehashedShardBatchWithRolloverAsync(
+        int shardId,
+        PrehashedInsertRow[] rows,
+        int rowOffset,
+        int count,
+        ShardInsertResult[] callerResults,
+        CancellationToken cancellationToken = default)
+    {
+        if ((uint)shardId >= (uint)_shardCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(shardId));
+        }
+
+        ArgumentNullException.ThrowIfNull(rows);
+        ArgumentNullException.ThrowIfNull(callerResults);
+        if (count is < 1 or > 128)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count), "count must be in range 1..128.");
+        }
+
+        if (rowOffset < 0 || rowOffset > rows.Length || rowOffset + count > rows.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(rowOffset), "rowOffset and count must designate a range within rows.");
+        }
+
+        try
+        {
+            ThrowIfDisposed();
+            EnsureStarted();
+
+            for (int attempt = 0; attempt < MaxRolloverRetries; attempt++)
+            {
+                GenerationState generation = GetActiveGeneration();
+                ShardWriteBatch batch = new(rows, rowOffset, count, callerResults);
+
+                try
+                {
+                    Interlocked.Add(ref generation.PendingWriteApprox[shardId], count);
+                    try
+                    {
+                        MaybeProactiveRolloverFromQueueDepth(generation, shardId);
+                        await generation.Queues[shardId].Writer.WriteAsync(ShardWriteQueueItem.OfBatch(batch), cancellationToken).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        Interlocked.Add(ref generation.PendingWriteApprox[shardId], -count);
+                        throw;
+                    }
+
+                    await batch.Done.Task.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    LogEnqueueAttemptFailed(ex, generation.GenerationId, shardId, attempt);
+                    throw;
+                }
+
+                bool needRetry = false;
+                for (int i = 0; i < count; i++)
+                {
+                    int idx = rows[rowOffset + i].SourceIndex;
+                    ShardInsertResult r = callerResults[idx];
+                    if (r == ShardInsertResult.Full || r == ShardInsertResult.ProbeLimitExceeded)
+                    {
+                        needRetry = true;
+                        break;
+                    }
+                }
+
+                if (!needRetry)
+                {
+                    return;
+                }
+
+                EnsureNextGeneration(generation.GenerationId);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogEnqueueFailedCritical(ex);
+            throw;
+        }
     }
 
     /// <summary>
@@ -762,79 +915,352 @@ internal sealed partial class ShardedHistoryWriter
         LogStopped();
     }
 
+    private void ProcessOneShardWrite(
+        GenerationState generation,
+        int shardId,
+        HistoryShard shard,
+        ref ulong localUsedSlots,
+        ref ulong insertsSinceBloomCheckpoint,
+        in ShardWriteRequest request,
+        long dequeuedTicks)
+    {
+        long queueWaitTicks = 0;
+        if (request.ChannelWriteStartTicks is long writeStartTicks)
+        {
+            queueWaitTicks = dequeuedTicks - writeStartTicks;
+        }
+
+        long execStartTicks = Stopwatch.GetTimestamp();
+        ShardInsertResult result = localUsedSlots >= shard.LoadLimitSlots
+            ? ShardInsertResult.Full
+            : shard.TryExistsOrInsertUnchecked(request.HashHi, request.HashLo, request.ServerHi, request.ServerLo);
+        long execEndTicks = Stopwatch.GetTimestamp();
+        if (request.ChannelWriteStartTicks is not null)
+        {
+            request.Completion.SetBenchTiming(queueWaitTicks, execEndTicks - execStartTicks);
+        }
+
+        if (result == ShardInsertResult.Inserted)
+        {
+            generation.BloomFilters[shardId].Add(request.HashHi, request.HashLo);
+            generation.BloomShardTrusted[shardId] = true;
+            localUsedSlots++;
+            MaybeProactiveRolloverFromUsedSlots(generation, localUsedSlots);
+            if ((localUsedSlots & UsedSlotsFlushMask) == 0)
+            {
+                shard.FlushUsedSlots(localUsedSlots);
+            }
+
+            if (_bloomCheckpointInsertInterval != 0)
+            {
+                insertsSinceBloomCheckpoint++;
+                if (insertsSinceBloomCheckpoint >= _bloomCheckpointInsertInterval)
+                {
+                    TryEnqueueBloomPersist(generation.BloomPaths[shardId], generation.BloomFilters[shardId]);
+                    insertsSinceBloomCheckpoint = 0;
+                }
+            }
+
+            request.Completion.SetResult(ShardInsertResult.Inserted);
+            return;
+        }
+
+        if (result == ShardInsertResult.Full)
+        {
+            Interlocked.Increment(ref generation.FullInsertFailures[shardId]);
+            request.Completion.SetResult(ShardInsertResult.Full);
+            return;
+        }
+
+        if (result == ShardInsertResult.ProbeLimitExceeded)
+        {
+            Interlocked.Increment(ref generation.ProbeLimitFailures[shardId]);
+            MaybeProactiveRolloverFromAggregateProbeFailures(generation);
+            request.Completion.SetResult(ShardInsertResult.ProbeLimitExceeded);
+            return;
+        }
+
+        request.Completion.SetResult(result);
+    }
+
+    private void ProcessCoalescedSingleShardWrites(
+        GenerationState generation,
+        int shardId,
+        HistoryShard shard,
+        ref ulong localUsedSlots,
+        ref ulong insertsSinceBloomCheckpoint,
+        ReadOnlySpan<ShardWriteRequest> requests,
+        long burstDequeuedTicks)
+    {
+        for (int i = 0; i < requests.Length; i++)
+        {
+            ProcessOneShardWrite(
+                generation,
+                shardId,
+                shard,
+                ref localUsedSlots,
+                ref insertsSinceBloomCheckpoint,
+                requests[i],
+                burstDequeuedTicks);
+        }
+    }
+
+    private void UpdateAdaptiveCoalesceBurst(
+        ref int adaptiveEffective,
+        ref int consecutiveWeakBursts,
+        int ceiling,
+        int burstLimit,
+        int n,
+        bool filledBurst,
+        long pendingApproxAfterBurst,
+        long burstDurationTicks)
+    {
+        int highWatermark = Math.Max(256, _queueCapacityPerShard / 16);
+        long latencyThresholdTicks = Stopwatch.Frequency / 500;
+
+        if (burstDurationTicks > latencyThresholdTicks)
+        {
+            adaptiveEffective = Math.Max(1, adaptiveEffective - 2);
+            consecutiveWeakBursts = 0;
+            adaptiveEffective = Math.Clamp(adaptiveEffective, 1, ceiling);
+            return;
+        }
+
+        bool weakBurst = n <= Math.Max(1, burstLimit / 4);
+        if (weakBurst)
+        {
+            consecutiveWeakBursts++;
+            if (consecutiveWeakBursts >= 3)
+            {
+                adaptiveEffective = Math.Max(1, adaptiveEffective - 1);
+                consecutiveWeakBursts = 0;
+            }
+        }
+        else
+        {
+            consecutiveWeakBursts = 0;
+        }
+
+        if (filledBurst && pendingApproxAfterBurst >= highWatermark)
+        {
+            int step = pendingApproxAfterBurst >= (long)highWatermark * 2 ? 4 : 2;
+            adaptiveEffective = Math.Min(ceiling, adaptiveEffective + step);
+        }
+        else if (filledBurst && pendingApproxAfterBurst < highWatermark / 2 && !weakBurst)
+        {
+            adaptiveEffective = Math.Min(ceiling, adaptiveEffective + 1);
+        }
+
+        adaptiveEffective = Math.Clamp(adaptiveEffective, 1, ceiling);
+    }
+
+    private void ProcessShardWriteBatch(
+        GenerationState generation,
+        int shardId,
+        HistoryShard shard,
+        ref ulong localUsedSlots,
+        ref ulong insertsSinceBloomCheckpoint,
+        ShardWriteBatch batch,
+        long dequeuedTicks)
+    {
+        _ = dequeuedTicks;
+        for (int i = 0; i < batch.Count; i++)
+        {
+            PrehashedInsertRow row = batch.Rows[batch.RowOffset + i];
+            ShardInsertResult result = localUsedSlots >= shard.LoadLimitSlots
+                ? ShardInsertResult.Full
+                : shard.TryExistsOrInsertUnchecked(row.HashHi, row.HashLo, row.ServerHi, row.ServerLo);
+            batch.CallerResults[row.SourceIndex] = result;
+
+            if (result == ShardInsertResult.Inserted)
+            {
+                generation.BloomFilters[shardId].Add(row.HashHi, row.HashLo);
+                generation.BloomShardTrusted[shardId] = true;
+                localUsedSlots++;
+                MaybeProactiveRolloverFromUsedSlots(generation, localUsedSlots);
+                if ((localUsedSlots & UsedSlotsFlushMask) == 0)
+                {
+                    shard.FlushUsedSlots(localUsedSlots);
+                }
+
+                if (_bloomCheckpointInsertInterval != 0)
+                {
+                    insertsSinceBloomCheckpoint++;
+                    if (insertsSinceBloomCheckpoint >= _bloomCheckpointInsertInterval)
+                    {
+                        TryEnqueueBloomPersist(generation.BloomPaths[shardId], generation.BloomFilters[shardId]);
+                        insertsSinceBloomCheckpoint = 0;
+                    }
+                }
+            }
+            else if (result == ShardInsertResult.Full)
+            {
+                Interlocked.Increment(ref generation.FullInsertFailures[shardId]);
+            }
+            else if (result == ShardInsertResult.ProbeLimitExceeded)
+            {
+                Interlocked.Increment(ref generation.ProbeLimitFailures[shardId]);
+                MaybeProactiveRolloverFromAggregateProbeFailures(generation);
+            }
+        }
+
+        batch.Done.TrySetResult(true);
+    }
+
     private async Task RunShardWriterAsync(GenerationState generation, int shardId, CancellationToken stoppingToken)
     {
         TryApplyShardWriterAffinity(shardId);
-        ChannelReader<ShardWriteRequest> reader = generation.Queues[shardId].Reader;
+        ChannelReader<ShardWriteQueueItem> reader = generation.Queues[shardId].Reader;
         HistoryShard shard = generation.Shards[shardId];
         ulong localUsedSlots = shard.UsedSlots;
         ulong insertsSinceBloomCheckpoint = 0;
+        var coalesceScratch = new ShardWriteRequest[HistoryDatabase.MaxHistoryAddBatch];
+        int adaptiveEffective = 0;
+        int consecutiveWeakBursts = 0;
 
         try
         {
             while (await reader.WaitToReadAsync(stoppingToken).ConfigureAwait(false))
             {
-                while (reader.TryRead(out ShardWriteRequest request))
+                while (reader.TryRead(out ShardWriteQueueItem item))
                 {
+                    int ceiling = Volatile.Read(ref _writerCoalesceMax);
+                    bool adaptiveOn = Volatile.Read(ref _writerCoalesceAdaptive) != 0 && ceiling > 1;
+
+                    if (item.Kind == ShardWriteQueueKind.Batch)
+                    {
+                        ShardWriteBatch batch = item.Batch!;
+                        Interlocked.Add(ref generation.PendingWriteApprox[shardId], -batch.Count);
+                        long dequeuedTicks = Stopwatch.GetTimestamp();
+                        ProcessShardWriteBatch(
+                            generation,
+                            shardId,
+                            shard,
+                            ref localUsedSlots,
+                            ref insertsSinceBloomCheckpoint,
+                            batch,
+                            dequeuedTicks);
+                        continue;
+                    }
+
+                    if (ceiling <= 1)
+                    {
+                        Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
+                        long dequeuedTicks = Stopwatch.GetTimestamp();
+                        ProcessOneShardWrite(
+                            generation,
+                            shardId,
+                            shard,
+                            ref localUsedSlots,
+                            ref insertsSinceBloomCheckpoint,
+                            item.Single,
+                            dequeuedTicks);
+                        continue;
+                    }
+
+                    int burstLimit = ceiling;
+                    if (adaptiveOn)
+                    {
+                        if (adaptiveEffective == 0)
+                        {
+                            adaptiveEffective = Math.Min(ceiling, 8);
+                        }
+
+                        adaptiveEffective = Math.Clamp(adaptiveEffective, 1, ceiling);
+                        burstLimit = adaptiveEffective;
+                    }
+
+                    if (burstLimit <= 1)
+                    {
+                        Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
+                        long dequeuedTicks = Stopwatch.GetTimestamp();
+                        ProcessOneShardWrite(
+                            generation,
+                            shardId,
+                            shard,
+                            ref localUsedSlots,
+                            ref insertsSinceBloomCheckpoint,
+                            item.Single,
+                            dequeuedTicks);
+                        continue;
+                    }
+
+                    int n = 0;
+                    coalesceScratch[n++] = item.Single;
                     Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
-                    long dequeuedTicks = Stopwatch.GetTimestamp();
-                    long queueWaitTicks = 0;
-                    if (request.ChannelWriteStartTicks is long writeStartTicks)
-                    {
-                        queueWaitTicks = dequeuedTicks - writeStartTicks;
-                    }
 
-                    long execStartTicks = Stopwatch.GetTimestamp();
-                    ShardInsertResult result = localUsedSlots >= shard.LoadLimitSlots
-                        ? ShardInsertResult.Full
-                        : shard.TryExistsOrInsertUnchecked(request.HashHi, request.HashLo, request.ServerHi, request.ServerLo);
-                    long execEndTicks = Stopwatch.GetTimestamp();
-                    if (request.ChannelWriteStartTicks is not null)
+                    while (n < burstLimit && reader.TryRead(out ShardWriteQueueItem next))
                     {
-                        request.Completion.SetBenchTiming(queueWaitTicks, execEndTicks - execStartTicks);
-                    }
-
-                    if (result == ShardInsertResult.Inserted)
-                    {
-                        generation.BloomFilters[shardId].Add(request.HashHi, request.HashLo);
-                        generation.BloomShardTrusted[shardId] = true;
-                        localUsedSlots++;
-                        MaybeProactiveRolloverFromUsedSlots(generation, localUsedSlots);
-                        if ((localUsedSlots & UsedSlotsFlushMask) == 0)
+                        if (next.Kind == ShardWriteQueueKind.Batch)
                         {
-                            shard.FlushUsedSlots(localUsedSlots);
-                        }
-
-                        if (_bloomCheckpointInsertInterval != 0)
-                        {
-                            insertsSinceBloomCheckpoint++;
-                            if (insertsSinceBloomCheckpoint >= _bloomCheckpointInsertInterval)
+                            long burstTicks = Stopwatch.GetTimestamp();
+                            ProcessCoalescedSingleShardWrites(
+                                generation,
+                                shardId,
+                                shard,
+                                ref localUsedSlots,
+                                ref insertsSinceBloomCheckpoint,
+                                coalesceScratch.AsSpan(0, n),
+                                burstTicks);
+                            if (adaptiveOn && n > 0)
                             {
-                                TryEnqueueBloomPersist(generation.BloomPaths[shardId], generation.BloomFilters[shardId]);
-                                insertsSinceBloomCheckpoint = 0;
+                                long pendingAfter = Interlocked.Read(ref generation.PendingWriteApprox[shardId]);
+                                long burstEnd = Stopwatch.GetTimestamp();
+                                UpdateAdaptiveCoalesceBurst(
+                                    ref adaptiveEffective,
+                                    ref consecutiveWeakBursts,
+                                    ceiling,
+                                    burstLimit,
+                                    n,
+                                    n == burstLimit,
+                                    pendingAfter,
+                                    burstEnd - burstTicks);
                             }
+
+                            ShardWriteBatch batch = next.Batch!;
+                            Interlocked.Add(ref generation.PendingWriteApprox[shardId], -batch.Count);
+                            ProcessShardWriteBatch(
+                                generation,
+                                shardId,
+                                shard,
+                                ref localUsedSlots,
+                                ref insertsSinceBloomCheckpoint,
+                                batch,
+                                burstTicks);
+                            n = 0;
+                            break;
                         }
 
-                        request.Completion.SetResult(ShardInsertResult.Inserted);
-                        continue;
+                        coalesceScratch[n++] = next.Single;
+                        Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
                     }
 
-                    if (result == ShardInsertResult.Full)
+                    if (n > 0)
                     {
-                        Interlocked.Increment(ref generation.FullInsertFailures[shardId]);
-                        request.Completion.SetResult(ShardInsertResult.Full);
-                        continue;
+                        long burstTicks = Stopwatch.GetTimestamp();
+                        ProcessCoalescedSingleShardWrites(
+                            generation,
+                            shardId,
+                            shard,
+                            ref localUsedSlots,
+                            ref insertsSinceBloomCheckpoint,
+                            coalesceScratch.AsSpan(0, n),
+                            burstTicks);
+                        if (adaptiveOn)
+                        {
+                            long pendingAfter = Interlocked.Read(ref generation.PendingWriteApprox[shardId]);
+                            long burstEnd = Stopwatch.GetTimestamp();
+                            UpdateAdaptiveCoalesceBurst(
+                                ref adaptiveEffective,
+                                ref consecutiveWeakBursts,
+                                ceiling,
+                                burstLimit,
+                                n,
+                                n == burstLimit,
+                                pendingAfter,
+                                burstEnd - burstTicks);
+                        }
                     }
-
-                    if (result == ShardInsertResult.ProbeLimitExceeded)
-                    {
-                        Interlocked.Increment(ref generation.ProbeLimitFailures[shardId]);
-                        MaybeProactiveRolloverFromAggregateProbeFailures(generation);
-                        request.Completion.SetResult(ShardInsertResult.ProbeLimitExceeded);
-                        continue;
-                    }
-
-                    request.Completion.SetResult(result);
                 }
 
                 MaybeProactiveRolloverFromQueueDepth(generation, shardId);
@@ -946,7 +1372,8 @@ internal sealed partial class ShardedHistoryWriter
             full,
             probe,
             pending,
-            used);
+            used,
+            Interlocked.Read(ref _bloomCheckpointDropped));
     }
 
     /// <summary>
@@ -1251,7 +1678,7 @@ internal sealed partial class ShardedHistoryWriter
 
         int bloomBitsPerShard = ComputeBloomBitsPerShard(nextGenerationCount: _generations.Count + 1);
         HistoryShard[] shards = new HistoryShard[_shardCount];
-        Channel<ShardWriteRequest>[] queues = new Channel<ShardWriteRequest>[_shardCount];
+        Channel<ShardWriteQueueItem>[] queues = new Channel<ShardWriteQueueItem>[_shardCount];
         Task[] writerTasks = new Task[_shardCount];
         long[] fullInsertFailures = new long[_shardCount];
         long[] probeLimitFailures = new long[_shardCount];
@@ -1267,7 +1694,7 @@ internal sealed partial class ShardedHistoryWriter
             string bloomPath = Path.Combine(generationRoot, $"{shardToken}.idx");
 
             shards[shardId] = new HistoryShard(shardPath, _slotsPerShard, _maxLoadFactorPercent);
-            queues[shardId] = Channel.CreateBounded<ShardWriteRequest>(
+            queues[shardId] = Channel.CreateBounded<ShardWriteQueueItem>(
                 new BoundedChannelOptions(_queueCapacityPerShard)
                 {
                     SingleReader = true,
@@ -1303,7 +1730,11 @@ internal sealed partial class ShardedHistoryWriter
         for (int shardId = 0; shardId < _shardCount; shardId++)
         {
             int capturedShardId = shardId;
-            writerTasks[shardId] = Task.Run(() => RunShardWriterAsync(generation, capturedShardId, _stopCts.Token), _stopCts.Token);
+            writerTasks[shardId] = Task.Factory.StartNew(
+                () => RunShardWriterAsync(generation, capturedShardId, _stopCts.Token).GetAwaiter().GetResult(),
+                _stopCts.Token,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
         }
 
         StartBloomWarmupIfNeeded(generation);
@@ -1391,21 +1822,39 @@ internal sealed partial class ShardedHistoryWriter
 
     private int GetShardId(ulong hashLo) => (int)(hashLo % (ulong)_shardCount);
 
-    private static void DrainPendingRequestsAsCanceled(ChannelReader<ShardWriteRequest> reader, GenerationState generation, int shardId, CancellationToken cancellationToken)
+    private static void DrainPendingRequestsAsCanceled(ChannelReader<ShardWriteQueueItem> reader, GenerationState generation, int shardId, CancellationToken cancellationToken)
     {
-        while (reader.TryRead(out ShardWriteRequest pending))
+        while (reader.TryRead(out ShardWriteQueueItem item))
         {
-            Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
-            pending.Completion.SetCanceled(cancellationToken);
+            if (item.Kind == ShardWriteQueueKind.Single)
+            {
+                Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
+                item.Single.Completion.SetCanceled(cancellationToken);
+            }
+            else
+            {
+                ShardWriteBatch batch = item.Batch!;
+                Interlocked.Add(ref generation.PendingWriteApprox[shardId], -batch.Count);
+                batch.TryCompleteCanceled(cancellationToken);
+            }
         }
     }
 
-    private static void DrainPendingRequestsAsFault(ChannelReader<ShardWriteRequest> reader, GenerationState generation, int shardId, Exception exception)
+    private static void DrainPendingRequestsAsFault(ChannelReader<ShardWriteQueueItem> reader, GenerationState generation, int shardId, Exception exception)
     {
-        while (reader.TryRead(out ShardWriteRequest pending))
+        while (reader.TryRead(out ShardWriteQueueItem item))
         {
-            Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
-            pending.Completion.SetException(exception);
+            if (item.Kind == ShardWriteQueueKind.Single)
+            {
+                Interlocked.Decrement(ref generation.PendingWriteApprox[shardId]);
+                item.Single.Completion.SetException(exception);
+            }
+            else
+            {
+                ShardWriteBatch batch = item.Batch!;
+                Interlocked.Add(ref generation.PendingWriteApprox[shardId], -batch.Count);
+                batch.TrySetException(exception);
+            }
         }
     }
 
@@ -1452,6 +1901,11 @@ internal sealed partial class ShardedHistoryWriter
     {
         _bloomCheckpointInsertInterval = inserts;
     }
+
+    internal void SetBloomCheckpointPersistMode(BloomCheckpointPersistMode mode) => _bloomCheckpointPersistMode = mode;
+
+    internal void SetCrossGenerationDuplicateCheck(HistoryCrossGenerationDuplicateCheck mode) =>
+        _crossGenerationDuplicateCheck = mode;
 
     internal void SetRolloverThresholds(ulong usedSlotsThreshold, int queueDepthThreshold, long aggregateProbeFailuresThreshold)
     {
@@ -1561,7 +2015,9 @@ internal sealed partial class ShardedHistoryWriter
                 SingleReader = true,
                 SingleWriter = false,
                 AllowSynchronousContinuations = false,
-                FullMode = BoundedChannelFullMode.Wait
+                FullMode = _bloomCheckpointPersistMode == BloomCheckpointPersistMode.Durability
+                    ? BoundedChannelFullMode.Wait
+                    : BoundedChannelFullMode.DropWrite
             });
             _bloomPersistTask = Task.Run(() => RunBloomPersistLoopAsync(_bloomPersistChannel.Reader, _stopCts.Token));
         }
@@ -1620,10 +2076,17 @@ internal sealed partial class ShardedHistoryWriter
             return;
         }
 
-        writer.WriteAsync(new BloomPersistWork(path, words, filter.BitCount, filter.HashFunctionCount), _stopCts.Token)
-            .AsTask()
-            .GetAwaiter()
-            .GetResult();
+        BloomPersistWork work = new(path, words, filter.BitCount, filter.HashFunctionCount);
+        if (_bloomCheckpointPersistMode == BloomCheckpointPersistMode.Durability)
+        {
+            writer.WriteAsync(work, _stopCts.Token).AsTask().GetAwaiter().GetResult();
+            return;
+        }
+
+        if (!writer.TryWrite(work))
+        {
+            Interlocked.Increment(ref _bloomCheckpointDropped);
+        }
     }
 
     private async Task CompleteBloomPersistAsync()
@@ -1657,6 +2120,75 @@ internal sealed partial class ShardedHistoryWriter
         ulong ServerLo,
         ShardCompletionSource Completion,
         long? ChannelWriteStartTicks);
+
+    private enum ShardWriteQueueKind : byte
+    {
+        Single = 0,
+        Batch = 1
+    }
+
+    /// <summary>Queued work item for a shard writer: one insert or a batch of inserts.</summary>
+    private readonly struct ShardWriteQueueItem
+    {
+        internal readonly ShardWriteQueueKind Kind;
+        internal readonly ShardWriteRequest Single;
+        internal readonly ShardWriteBatch? Batch;
+
+        private ShardWriteQueueItem(ShardWriteQueueKind kind, ShardWriteRequest single, ShardWriteBatch? batch)
+        {
+            Kind = kind;
+            Single = single;
+            Batch = batch;
+        }
+
+        internal static ShardWriteQueueItem OfSingle(ShardWriteRequest request) =>
+            new(ShardWriteQueueKind.Single, request, null);
+
+        internal static ShardWriteQueueItem OfBatch(ShardWriteBatch batch) =>
+            new(ShardWriteQueueKind.Batch, default, batch);
+    }
+
+    internal readonly struct PrehashedInsertRow
+    {
+        internal readonly int SourceIndex;
+        internal readonly ulong HashHi;
+        internal readonly ulong HashLo;
+        internal readonly ulong ServerHi;
+        internal readonly ulong ServerLo;
+
+        internal PrehashedInsertRow(int sourceIndex, ulong hashHi, ulong hashLo, ulong serverHi, ulong serverLo)
+        {
+            SourceIndex = sourceIndex;
+            HashHi = hashHi;
+            HashLo = hashLo;
+            ServerHi = serverHi;
+            ServerLo = serverLo;
+        }
+    }
+
+    /// <summary>One channel message carrying multiple inserts for the same shard.</summary>
+    internal sealed class ShardWriteBatch
+    {
+        internal PrehashedInsertRow[] Rows { get; }
+        internal int RowOffset { get; }
+        internal int Count { get; }
+        internal ShardInsertResult[] CallerResults { get; }
+        internal TaskCompletionSource<bool> Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal long? ChannelWriteStartTicks { get; set; }
+
+        internal ShardWriteBatch(PrehashedInsertRow[] rows, int rowOffset, int count, ShardInsertResult[] callerResults)
+        {
+            Rows = rows;
+            RowOffset = rowOffset;
+            Count = count;
+            CallerResults = callerResults;
+        }
+
+        internal void TryCompleteCanceled(CancellationToken cancellationToken) =>
+            Done.TrySetCanceled(cancellationToken);
+
+        internal void TrySetException(Exception exception) => Done.TrySetException(exception);
+    }
 
     private readonly record struct BloomPersistWork(string Path, ulong[] Words, int BitCount, int HashCount);
 
@@ -1703,7 +2235,7 @@ internal sealed partial class ShardedHistoryWriter
     private sealed record GenerationState(
         int GenerationId,
         HistoryShard[] Shards,
-        Channel<ShardWriteRequest>[] Queues,
+        Channel<ShardWriteQueueItem>[] Queues,
         Task[] WriterTasks,
         long[] FullInsertFailures,
         long[] ProbeLimitFailures,
@@ -2157,6 +2689,7 @@ internal sealed partial class ShardedHistoryWriter
         long FullInsertFailures,
         long ProbeLimitFailures,
         long PendingQueueItemsApprox,
-        ulong UsedSlotsApprox);
+        ulong UsedSlotsApprox,
+        long BloomCheckpointsDropped);
 
 }

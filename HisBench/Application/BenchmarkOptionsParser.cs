@@ -1,5 +1,6 @@
 using System.Globalization;
 using HisBench.Contracts;
+using HistoryDB;
 
 namespace HisBench.Application;
 
@@ -51,6 +52,9 @@ internal sealed class BenchmarkOptionsParser : IBenchmarkOptionsParser
             int queueDepthThreshold = 0;
             long probeFailureThreshold = 0;
             bool autoTune = false;
+            BloomCheckpointPersistMode bloomPersistMode = BloomCheckpointPersistMode.Throughput;
+            HistoryCrossGenerationDuplicateCheck enqueueDupCheck = HistoryCrossGenerationDuplicateCheck.Full;
+            int insertBatchSize = 0;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -86,11 +90,45 @@ internal sealed class BenchmarkOptionsParser : IBenchmarkOptionsParser
                     case "--load-factor": maxLoadFactorPercent = (ulong)ParsePositiveLong(args, ref i, "--load-factor"); break;
                     case "--queue-capacity": queueCapacityPerShard = ParsePositiveInt(args, ref i, "--queue-capacity"); break;
                     case "--retained-generations": maxRetainedGenerations = ParsePositiveInt(args, ref i, "--retained-generations"); break;
-                    case "--bloom-checkpoint-interval": bloomCheckpointInsertInterval = (ulong)ParsePositiveLong(args, ref i, "--bloom-checkpoint-interval"); break;
+                    case "--bloom-checkpoint-interval":
+                        bloomCheckpointInsertInterval = (ulong)ParseNonNegativeLong(args, ref i, "--bloom-checkpoint-interval");
+                        break;
                     case "--scrub-samples": scrubberSamplesPerTick = ParsePositiveInt(args, ref i, "--scrub-samples"); break;
                     case "--scrub-interval-ms": scrubberIntervalMs = ParsePositiveInt(args, ref i, "--scrub-interval-ms"); break;
                     case "--queue-threshold": queueDepthThreshold = ParsePositiveInt(args, ref i, "--queue-threshold"); break;
                     case "--probe-threshold": probeFailureThreshold = ParsePositiveLong(args, ref i, "--probe-threshold"); break;
+                    case "--bloom-persist":
+                        bloomPersistMode = ParseBloomPersistMode(Next(args, ref i, "--bloom-persist"));
+                        break;
+                    case "--enqueue-dup-check":
+                        enqueueDupCheck = ParseEnqueueDupCheck(Next(args, ref i, "--enqueue-dup-check"));
+                        break;
+                    case "--insert-batch":
+                        insertBatchSize = 128;
+                        if (i + 1 < args.Length)
+                        {
+                            string next = args[i + 1];
+                            if (!next.StartsWith("-", StringComparison.Ordinal) &&
+                                long.TryParse(next, NumberStyles.Integer, CultureInfo.InvariantCulture, out long v))
+                            {
+                                i++;
+                                if (v == 0)
+                                {
+                                    insertBatchSize = 0;
+                                }
+                                else if (v is >= 1 and <= HistoryDatabase.MaxHistoryAddBatch)
+                                {
+                                    insertBatchSize = (int)v;
+                                }
+                                else
+                                {
+                                    throw new ArgumentException(
+                                        $"Invalid value for --insert-batch; expected 0..{HistoryDatabase.MaxHistoryAddBatch} (0 = writer coalesce 1, omit value for default 128).");
+                                }
+                            }
+                        }
+
+                        break;
                     case "--auto": autoTune = true; break;
                     case "--help":
                         showHelp = true;
@@ -136,7 +174,10 @@ internal sealed class BenchmarkOptionsParser : IBenchmarkOptionsParser
                 scrubberIntervalMs,
                 queueDepthThreshold,
                 probeFailureThreshold,
-                autoTune));
+                autoTune,
+                bloomPersistMode,
+                enqueueDupCheck,
+                insertBatchSize));
         }
         catch (ArgumentException ex)
         {
@@ -248,5 +289,19 @@ internal sealed class BenchmarkOptionsParser : IBenchmarkOptionsParser
         "ramp" => BurstProfile.Ramp,
         "wave" => BurstProfile.Wave,
         _ => throw new ArgumentException("Invalid --burst-profile. Expected: spike|ramp|wave.")
+    };
+
+    private static BloomCheckpointPersistMode ParseBloomPersistMode(string raw) => raw.ToLowerInvariant() switch
+    {
+        "throughput" => BloomCheckpointPersistMode.Throughput,
+        "durability" => BloomCheckpointPersistMode.Durability,
+        _ => throw new ArgumentException("Invalid --bloom-persist. Expected: throughput|durability.")
+    };
+
+    private static HistoryCrossGenerationDuplicateCheck ParseEnqueueDupCheck(string raw) => raw.ToLowerInvariant() switch
+    {
+        "full" => HistoryCrossGenerationDuplicateCheck.Full,
+        "active-generation-only" => HistoryCrossGenerationDuplicateCheck.ActiveGenerationOnly,
+        _ => throw new ArgumentException("Invalid --enqueue-dup-check. Expected: full|active-generation-only.")
     };
 }

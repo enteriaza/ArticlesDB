@@ -125,6 +125,7 @@ internal sealed partial class BenchmarkOrchestrator : IBenchmarkOrchestrator
         ProcessResourceSnapshot startResources = _telemetryReader.ReadCurrent();
         HistoryDatabase database = _databaseFactory.Create(options);
         ConfigureDatabase(database, options);
+        metrics.DatabaseOpenConfigureElapsedMs = TimeUtil.ElapsedMilliseconds(runStartTicks);
 
         Task samplerTask = options.CorrelationSampleMs > 0
             ? RunCorrelationSamplerAsync(database, metrics, TimeSpan.FromMilliseconds(options.CorrelationSampleMs), samplerCts.Token)
@@ -174,7 +175,11 @@ internal sealed partial class BenchmarkOrchestrator : IBenchmarkOrchestrator
         }
         finally
         {
+            long historySyncStart = Stopwatch.GetTimestamp();
             database.HistorySync();
+            metrics.HistorySyncElapsedMs = TimeUtil.ElapsedMilliseconds(historySyncStart);
+
+            long samplerShutdownStart = Stopwatch.GetTimestamp();
             samplerCts.Cancel();
             try
             {
@@ -184,6 +189,7 @@ internal sealed partial class BenchmarkOrchestrator : IBenchmarkOrchestrator
             {
             }
             samplerCts.Dispose();
+            metrics.SamplerShutdownElapsedMs = TimeUtil.ElapsedMilliseconds(samplerShutdownStart);
         }
 
         BenchmarkRunReport report = new(
@@ -300,8 +306,18 @@ internal sealed partial class BenchmarkOrchestrator : IBenchmarkOrchestrator
 
     private static void ConfigureDatabase(HistoryDatabase db, BenchmarkOptions options)
     {
+        db.SetBloomCheckpointPersistMode(options.BloomCheckpointPersistMode);
+        db.SetCrossGenerationDuplicateCheck(options.CrossGenerationDuplicateCheck);
         db.SetBloomCheckpointInsertInterval(options.BloomCheckpointInsertInterval);
         db.SetSlotScrubberTuning(options.ScrubberSamplesPerTick, options.ScrubberIntervalMs);
+        if (options.InsertBatchSize > 0)
+        {
+            db.SetWriterCoalesceBatchSize(Math.Clamp(options.InsertBatchSize, 1, HistoryDatabase.MaxHistoryAddBatch));
+        }
+        else
+        {
+            db.SetWriterCoalesceBatchSize(1);
+        }
         if (options.TargetGenerations > 0)
         {
             ulong perGen = (ulong)(options.ShardCount * (double)options.SlotsPerShard * options.MaxLoadFactorPercent / 100.0 * options.FillFactor);
@@ -340,6 +356,7 @@ internal sealed partial class BenchmarkOrchestrator : IBenchmarkOrchestrator
     private static async Task RunPhasedAsync(HistoryDatabase db, BenchmarkOptions options, BenchmarkMetrics metrics, CancellationToken ct)
     {
         long addTarget = ResolveAddTarget(options);
+        long insertPhaseStart = Stopwatch.GetTimestamp();
         await ExecuteWorkersAsync(options.AddForks, async _ =>
         {
             while (!ct.IsCancellationRequested)
@@ -355,6 +372,9 @@ internal sealed partial class BenchmarkOrchestrator : IBenchmarkOrchestrator
             }
         }).ConfigureAwait(false);
 
+        metrics.InsertPhaseElapsedMs = TimeUtil.ElapsedMilliseconds(insertPhaseStart);
+
+        long duplicatePhaseStart = Stopwatch.GetTimestamp();
         await ExecuteWorkersAsync(options.AddForks, async _ =>
         {
             while (!ct.IsCancellationRequested)
@@ -379,8 +399,11 @@ internal sealed partial class BenchmarkOrchestrator : IBenchmarkOrchestrator
                 }
             }
         }).ConfigureAwait(false);
+        metrics.DuplicatePhaseElapsedMs = TimeUtil.ElapsedMilliseconds(duplicatePhaseStart);
 
+        long lookupPhaseStart = Stopwatch.GetTimestamp();
         await ExecuteLookupsAsync(db, options, metrics, options.LookupCount, ct).ConfigureAwait(false);
+        metrics.LookupPhaseElapsedMs = TimeUtil.ElapsedMilliseconds(lookupPhaseStart);
     }
 
     private static async Task RunMixedAsync(HistoryDatabase db, BenchmarkOptions options, BenchmarkMetrics metrics, CancellationToken ct)

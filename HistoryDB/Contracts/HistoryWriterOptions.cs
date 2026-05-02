@@ -1,5 +1,7 @@
 // HistoryWriterOptions.cs -- strongly typed configuration model for HistoryDB writer construction.
 
+using HistoryDB;
+
 namespace HistoryDB.Contracts;
 
 /// <summary>
@@ -8,6 +10,9 @@ namespace HistoryDB.Contracts;
 internal sealed record HistoryWriterOptions
 {
     public required string RootPath { get; init; }
+
+    /// <summary>Pre-enqueue duplicate scan across retained generations (default <see cref="HistoryCrossGenerationDuplicateCheck.Full"/>).</summary>
+    public HistoryCrossGenerationDuplicateCheck CrossGenerationDuplicateCheck { get; init; } = HistoryCrossGenerationDuplicateCheck.Full;
 
     public int ShardCount { get; init; } = 128;
 
@@ -39,6 +44,9 @@ internal sealed record BloomOptions
     public ulong CheckpointInsertInterval { get; init; } = 1_000_000;
 
     public ulong CheckpointMaxSnapshotBytes { get; init; } = 32UL * 1024 * 1024;
+
+    /// <summary>Whether Bloom checkpoint enqueue may drop under backpressure (throughput) or block writers (durability).</summary>
+    public BloomCheckpointPersistMode CheckpointPersistMode { get; init; } = BloomCheckpointPersistMode.Throughput;
 }
 
 internal sealed record RolloverOptions

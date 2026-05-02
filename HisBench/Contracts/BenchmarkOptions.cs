@@ -1,3 +1,5 @@
+using HistoryDB;
+
 namespace HisBench.Contracts;
 
 internal sealed record BenchmarkOptions(
@@ -36,7 +38,11 @@ internal sealed record BenchmarkOptions(
     int ScrubberIntervalMs,
     int QueueDepthThreshold,
     long ProbeFailureThreshold,
-    bool AutoTune);
+    bool AutoTune,
+    BloomCheckpointPersistMode BloomCheckpointPersistMode,
+    HistoryCrossGenerationDuplicateCheck CrossGenerationDuplicateCheck,
+    /// <summary>Passed to <see cref="HistoryDatabase.SetWriterCoalesceBatchSize"/> as the coalesce ceiling (1..128). 0 = ceiling 1 (writer drains one single per burst). Adaptive tuning is on by default when ceiling &gt; 1.</summary>
+    int InsertBatchSize);
 
 internal enum BurstProfile
 {

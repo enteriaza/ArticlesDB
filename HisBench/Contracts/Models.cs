@@ -59,6 +59,24 @@ internal sealed class BenchmarkMetrics
     internal readonly List<RestartWarmupSample> RestartWarmupTimeline = [];
     internal long RestartSteadyStateMs = -1;
 
+    /// <summary>Wall time of the insert-only phase in <see cref="BenchmarkOrchestrator.RunPhasedAsync"/>; zero when not measured (e.g. mixed mode).</summary>
+    internal long InsertPhaseElapsedMs;
+
+    /// <summary>Wall time of the duplicate pass in phased mode.</summary>
+    internal long DuplicatePhaseElapsedMs;
+
+    /// <summary>Wall time of the lookup pass in phased mode.</summary>
+    internal long LookupPhaseElapsedMs;
+
+    /// <summary>Wall time from run clock start through storage sizing, telemetry snapshot, <c>HistoryDatabase</c> construction, and <c>ConfigureDatabase</c>.</summary>
+    internal long DatabaseOpenConfigureElapsedMs;
+
+    /// <summary>Wall time of <c>HistorySync()</c> in <c>finally</c>.</summary>
+    internal long HistorySyncElapsedMs;
+
+    /// <summary>Wall time to cancel and await the correlation sampler task in <c>finally</c>.</summary>
+    internal long SamplerShutdownElapsedMs;
+
     private readonly object _sampleLock = new();
     private readonly Queue<CorrelationSample> _correlationTail = new();
     private const int MaxCorrelationSamples = 2048;

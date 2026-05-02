@@ -37,7 +37,9 @@ dotnet run --project HisBench -- --help
 - `--degraded-p99-us N`
 - `--shards N`, `--slots-per-shard N` (slots must be a power of two; defaults: 128 shards, ~128 MiB mmap per shard)
 - `--load-factor N`, `--queue-capacity N`, `--retained-generations N`
-- `--bloom-checkpoint-interval N`, `--scrub-samples N`, `--scrub-interval-ms N`
+- `--bloom-checkpoint-interval N`, `--bloom-persist throughput|durability`, `--enqueue-dup-check full|active-generation-only`
+- `--insert-batch [N]` — sets `HistoryDatabase.SetWriterCoalesceBatchSize(N)` as the **ceiling** for writer-side coalescing (default **N=128** when omitted; `N` in 1..128; `0` means ceiling 1). When `N` &gt; 1, the library **adaptively** tunes the effective burst per shard up to `N` unless you call `SetWriterCoalesceAdaptive(false)` in custom code. Inserts still use `HistoryAddForBenchmarkAsync` per key (same dedupe/hash as unbatched); only mmap/Bloom work is amortized in the writer. Use a **fresh** `--history-dir` when comparing runs; an existing dataset will make inserts mostly duplicates.
+- `--scrub-samples N`, `--scrub-interval-ms N`
 - `--queue-threshold N`, `--probe-threshold N` (rollover tuning when `--target-generations` is used)
 - `--auto` (runs repeated 4M insert + 4M lookup trials and recommends tuned settings)
 

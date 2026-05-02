@@ -1,5 +1,7 @@
 // HistoryDatabase.cs -- public HistoryDB API using string message IDs and server UUIDs, internally hashed to MD5 for storage.
 
+using System.Buffers;
+
 using HistoryDB.Application;
 using HistoryDB.Contracts;
 
@@ -132,6 +134,226 @@ public sealed class HistoryDatabase : IAsyncDisposable, IDisposable
         return false;
     }
 
+    /// <summary>Maximum number of tuples accepted by <see cref="HistoryAddBatchAsync"/>.</summary>
+    public const int MaxHistoryAddBatch = 128;
+
+    /// <summary>
+    /// Adds many message IDs in fewer async and channel operations than repeated <see cref="HistoryAddAsync"/> (one channel write per shard per call).
+    /// </summary>
+    /// <param name="items">Pairs of message id and server UUID string.</param>
+    /// <param name="results">Receives one <see cref="ShardInsertResult"/> per item; length must be at least <c>items.Length</c>.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <remarks>
+    /// Items are grouped by hash shard internally. Cross-generation duplicate detection matches <see cref="HistoryAddAsync"/> when enabled.
+    /// </remarks>
+    public async ValueTask HistoryAddBatchAsync(
+        ReadOnlyMemory<(string messageId, string serverId)> items,
+        Memory<ShardInsertResult> results,
+        CancellationToken cancellationToken = default)
+    {
+        if (results.Length < items.Length)
+        {
+            throw new ArgumentException("results.Length must be >= items.Length.", nameof(results));
+        }
+
+        if (items.IsEmpty)
+        {
+            return;
+        }
+
+        if (items.Length > MaxHistoryAddBatch)
+        {
+            throw new ArgumentOutOfRangeException(nameof(items), items.Length, $"At most {MaxHistoryAddBatch} items per batch.");
+        }
+
+        (string messageId, string serverId)[] rowInputs = items.ToArray();
+        await HistoryAddBatchFromRowArrayAsync(rowInputs, rowInputs.Length, results, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Like <see cref="HistoryAddBatchAsync"/> but uses an existing row buffer (first <paramref name="n"/> elements) so callers such as HisBench avoid an extra <c>ToArray()</c> copy.
+    /// </summary>
+    /// <remarks>The caller must not mutate <paramref name="rowInputs"/>[0..<paramref name="n"/>) until the returned task completes.</remarks>
+    internal ValueTask HistoryAddBatchFromRowArrayAsync(
+        (string messageId, string serverId)[] rowInputs,
+        int n,
+        Memory<ShardInsertResult> results,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(rowInputs);
+        if ((uint)n > (uint)MaxHistoryAddBatch || n > rowInputs.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(n));
+        }
+
+        if (results.Length < n)
+        {
+            throw new ArgumentException("results.Length must be >= n.", nameof(results));
+        }
+
+        return HistoryAddBatchFromRowArrayCoreAsync(rowInputs, n, results, cancellationToken);
+    }
+
+    private async ValueTask HistoryAddBatchFromRowArrayCoreAsync(
+        (string messageId, string serverId)[] rowInputs,
+        int n,
+        Memory<ShardInsertResult> results,
+        CancellationToken cancellationToken)
+    {
+        (string messageId, string serverId)[]? tuples = _enableWalkJournal ? rowInputs : null;
+        var scratch = new ShardInsertResult[n];
+        var msgHashes = new Hash128[n];
+        var srvHashes = new Hash128[n];
+
+        for (int i = 0; i < n; i++)
+        {
+            (string messageId, string serverId) = rowInputs[i];
+
+            if (!Guid.TryParse(serverId, out _))
+            {
+                throw new ArgumentException("serverId must be a valid UUID string.", nameof(rowInputs));
+            }
+
+            msgHashes[i] = _hashProvider.ComputeHash(messageId);
+            srvHashes[i] = _hashProvider.ComputeHash(serverId);
+        }
+
+        int shardCount = _writer.ShardCount;
+        int[] countByShard = ArrayPool<int>.Shared.Rent(shardCount);
+        try
+        {
+            countByShard.AsSpan(0, shardCount).Clear();
+
+            for (int i = 0; i < n; i++)
+            {
+                if (_writer.IsDuplicateBeforeEnqueue(msgHashes[i].Hi, msgHashes[i].Lo))
+                {
+                    scratch[i] = ShardInsertResult.Duplicate;
+                    continue;
+                }
+
+                int shardId = (int)(msgHashes[i].Lo % (ulong)shardCount);
+                countByShard[shardId]++;
+            }
+
+            int nonEmptyShards = 0;
+            for (int s = 0; s < shardCount; s++)
+            {
+                if (countByShard[s] != 0)
+                {
+                    nonEmptyShards++;
+                }
+            }
+
+            int[] shardStarts = ArrayPool<int>.Shared.Rent(shardCount);
+            int[] flatIdx = ArrayPool<int>.Shared.Rent(n);
+            int[] writePos = ArrayPool<int>.Shared.Rent(shardCount);
+            try
+            {
+                int enqueueCount = 0;
+                for (int s = 0; s < shardCount; s++)
+                {
+                    shardStarts[s] = enqueueCount;
+                    enqueueCount += countByShard[s];
+                }
+
+                shardStarts.AsSpan(0, shardCount).CopyTo(writePos.AsSpan(0, shardCount));
+
+                for (int i = 0; i < n; i++)
+                {
+                    if (scratch[i] == ShardInsertResult.Duplicate)
+                    {
+                        continue;
+                    }
+
+                    int shardId = (int)(msgHashes[i].Lo % (ulong)shardCount);
+                    flatIdx[writePos[shardId]++] = i;
+                }
+
+                if (nonEmptyShards > 0)
+                {
+                    var packedRows = new ShardedHistoryWriter.PrehashedInsertRow[enqueueCount];
+                    for (int shardId = 0; shardId < shardCount; shardId++)
+                    {
+                        int cnt = countByShard[shardId];
+                        if (cnt == 0)
+                        {
+                            continue;
+                        }
+
+                        int baseOff = shardStarts[shardId];
+                        for (int j = 0; j < cnt; j++)
+                        {
+                            int ii = flatIdx[baseOff + j];
+                            packedRows[baseOff + j] = new ShardedHistoryWriter.PrehashedInsertRow(
+                                ii,
+                                msgHashes[ii].Hi,
+                                msgHashes[ii].Lo,
+                                srvHashes[ii].Hi,
+                                srvHashes[ii].Lo);
+                        }
+                    }
+
+                    Task[] shardTasks = new Task[nonEmptyShards];
+                    int taskIdx = 0;
+                    for (int shardId = 0; shardId < shardCount; shardId++)
+                    {
+                        int cnt = countByShard[shardId];
+                        if (cnt == 0)
+                        {
+                            continue;
+                        }
+
+                        int rowOffset = shardStarts[shardId];
+                        shardTasks[taskIdx++] = _writer.EnqueuePrehashedShardBatchWithRolloverAsync(
+                            shardId,
+                            packedRows,
+                            rowOffset,
+                            cnt,
+                            scratch,
+                            cancellationToken);
+                    }
+
+                    await Task.WhenAll(shardTasks).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(shardStarts);
+                ArrayPool<int>.Shared.Return(flatIdx);
+                ArrayPool<int>.Shared.Return(writePos);
+            }
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(countByShard);
+        }
+
+        if (_enableWalkJournal && tuples is not null)
+        {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            for (int i = 0; i < n; i++)
+            {
+                if (scratch[i] == ShardInsertResult.Inserted)
+                {
+                    (string messageId, string serverId) = tuples[i];
+                    _metadata.RecordInserted(messageId, serverId, msgHashes[i], now, persistJournalAndWalk: _enableWalkJournal);
+                }
+            }
+        }
+
+        CopyBatchScratchToResults(scratch, results, n);
+    }
+
+    private static void CopyBatchScratchToResults(ShardInsertResult[] scratch, Memory<ShardInsertResult> results, int n)
+    {
+        scratch.AsSpan(0, n).CopyTo(results.Span[..n]);
+    }
+
+    /// <summary>Blocking variant of <see cref="HistoryAddBatchAsync"/>.</summary>
+    public void HistoryAddBatch(ReadOnlyMemory<(string messageId, string serverId)> items, Memory<ShardInsertResult> results) =>
+        HistoryAddBatchAsync(items, results, default).AsTask().ConfigureAwait(false).GetAwaiter().GetResult();
+
     /// <summary>
     /// Benchmark-only async insert that measures end-to-end enqueue completion without blocking a thread pool thread.
     /// </summary>
@@ -208,6 +430,30 @@ public sealed class HistoryDatabase : IAsyncDisposable, IDisposable
     public void SetBloomCheckpointInsertInterval(ulong inserts) => _writer.SetBloomCheckpointInsertInterval(inserts);
 
     /// <summary>
+    /// Chooses Bloom checkpoint persistence behavior: non-blocking with drops under backpressure (default), or blocking writers until checkpoints are queued.
+    /// </summary>
+    public void SetBloomCheckpointPersistMode(BloomCheckpointPersistMode mode) => _writer.SetBloomCheckpointPersistMode(mode);
+
+    /// <summary>
+    /// Tunes pre-enqueue duplicate detection across retained generations (default <see cref="HistoryCrossGenerationDuplicateCheck.Full"/>).
+    /// </summary>
+    public void SetCrossGenerationDuplicateCheck(HistoryCrossGenerationDuplicateCheck mode) =>
+        _writer.SetCrossGenerationDuplicateCheck(mode);
+
+    /// <summary>
+    /// Sets the maximum number of single-queue inserts each shard writer may dequeue and apply in one burst (1 = one insert per drain, up to <see cref="MaxHistoryAddBatch"/>).
+    /// When <see cref="SetWriterCoalesceAdaptive"/> is enabled and the ceiling is greater than 1, writers tune the effective burst size up to this maximum.
+    /// Hashing and duplicate checks still run per enqueue; only shard mmap/Bloom work is amortized inside the writer.
+    /// </summary>
+    public void SetWriterCoalesceBatchSize(int maxPerBurst) => _writer.SetWriterCoalesceMax(maxPerBurst);
+
+    /// <summary>
+    /// When <see langword="true"/> (default), each shard writer adaptively tunes its coalesce burst size between 1 and the ceiling from <see cref="SetWriterCoalesceBatchSize"/> whenever that ceiling is greater than 1.
+    /// When <see langword="false"/>, the effective burst size stays equal to the ceiling (fixed coalescing).
+    /// </summary>
+    public void SetWriterCoalesceAdaptive(bool enabled) => _writer.SetWriterCoalesceAdaptive(enabled);
+
+    /// <summary>
     /// Tunes proactive rollover thresholds.
     /// </summary>
     public void SetRolloverThresholds(ulong usedSlotsThreshold, int queueDepthThreshold, long aggregateProbeFailuresThreshold) =>
@@ -231,7 +477,8 @@ public sealed class HistoryDatabase : IAsyncDisposable, IDisposable
             m.PendingQueueItemsApprox,
             m.FullInsertFailures,
             m.ProbeLimitFailures,
-            m.UsedSlotsApprox);
+            m.UsedSlotsApprox,
+            m.BloomCheckpointsDropped);
     }
 
     /// <summary>
@@ -263,4 +510,5 @@ public readonly record struct HistoryPerformanceSnapshot(
     long PendingQueueItemsApprox,
     long FullInsertFailures,
     long ProbeLimitFailures,
-    ulong UsedSlotsApprox);
+    ulong UsedSlotsApprox,
+    long BloomCheckpointsDropped);

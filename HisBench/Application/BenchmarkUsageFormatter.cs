@@ -15,7 +15,10 @@ internal static class BenchmarkUsageFormatter
         sb.AppendLine("                [--burst-mode] [--burst-profile spike|ramp|wave] [--burst-duty-pct n] [--burst-sleep-ms n]");
         sb.AppendLine("                [--correlation-ms n] [--saturation-queue-depth n] [--degraded-p99-us n] [--mapping-file file]");
         sb.AppendLine("                [--shards n] [--slots-per-shard n] [--load-factor n] [--queue-capacity n] [--retained-generations n]");
-        sb.AppendLine("                [--bloom-checkpoint-interval n] [--scrub-samples n] [--scrub-interval-ms n]");
+        sb.AppendLine("                [--bloom-checkpoint-interval n] [--bloom-persist throughput|durability]");
+        sb.AppendLine("                [--enqueue-dup-check full|active-generation-only]");
+        sb.AppendLine("                [--insert-batch [n]]");
+        sb.AppendLine("                [--scrub-samples n] [--scrub-interval-ms n]");
         sb.AppendLine("                [--queue-threshold n] [--probe-threshold n] [--auto] [--help]");
         sb.AppendLine();
         sb.AppendLine("  --add-count N                 Number of history additions (default: 2000000)");
@@ -45,7 +48,12 @@ internal static class BenchmarkUsageFormatter
         sb.AppendLine("  --load-factor N               Max load factor percent for inserts (default: 75)");
         sb.AppendLine("  --queue-capacity N            Bounded channel capacity per shard writer (default: 1000000)");
         sb.AppendLine("  --retained-generations N      Generations retained before retiring oldest (default: 8)");
-        sb.AppendLine("  --bloom-checkpoint-interval N Inserts between Bloom checkpoint attempts (default: 1000000)");
+        sb.AppendLine("  --bloom-checkpoint-interval N Inserts between Bloom checkpoint attempts (0 disables; default: 1000000)");
+        sb.AppendLine("  --bloom-persist MODE          throughput (default): TryWrite Bloom checkpoints, drops if persist queue is full");
+        sb.AppendLine("                                durability: shard writers block until checkpoint is queued");
+        sb.AppendLine("  --enqueue-dup-check MODE      full (default): scan older generations before enqueue");
+        sb.AppendLine("                                active-generation-only: skip that scan (benchmark unique keys only)");
+        sb.AppendLine("  --insert-batch [N]            Writer coalesce ceiling N (adaptive effective burst up to N when N>1; default N=128; 1..128; 0=1)");
         sb.AppendLine("  --scrub-samples N             Slot scrubber samples per tick (default: 256)");
         sb.AppendLine("  --scrub-interval-ms N         Slot scrubber interval in ms (default: 30000)");
         sb.AppendLine("  --queue-threshold N           Proactive rollover queue depth threshold (0 disables; default: 0). Applied when --target-generations > 0");

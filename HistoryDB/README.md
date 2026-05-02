@@ -40,6 +40,8 @@ The public API is intentionally small:
 - `HistoryDatabase(...)` (initialization)
 - `bool HistoryLookup(string messageId)`
 - `bool HistoryAdd(string messageId, string serverId)`
+- `ValueTask HistoryAddBatchAsync(ReadOnlyMemory<(string messageId, string serverId)> items, Memory<ShardInsertResult> results, CancellationToken cancellationToken = default)` (up to `HistoryDatabase.MaxHistoryAddBatch` / 128 items; one channel message per shard; non-empty shards are enqueued concurrently)
+- `void HistoryAddBatch(...)` (blocking)
 - `bool HistoryExpire(string messageId)`
 - `int HistoryExpire(string[] messageIds)`
 - `void HistorySync()`
@@ -47,6 +49,8 @@ The public API is intentionally small:
 
 Performance tuning methods:
 
+- `SetWriterCoalesceBatchSize(int maxPerBurst)` — sets the **ceiling** on single-queue items each shard writer may dequeue and apply in one drain (1..128; 1 = legacy one-at-a-time). When the ceiling is greater than 1, writers **adapt** the effective burst size by default; call `SetWriterCoalesceAdaptive(false)` to pin the effective size to the ceiling. Enqueue and duplicate checks stay per request; coalescing is writer-side only.
+- `SetWriterCoalesceAdaptive(bool enabled)` — enable or disable adaptive coalescing (default enabled whenever the ceiling is greater than 1).
 - `SetBloomCheckpointInsertInterval(ulong inserts)`
 - `SetRolloverThresholds(ulong usedSlotsThreshold, int queueDepthThreshold, long aggregateProbeFailuresThreshold)`
 - `SetSlotScrubberTuning(int samplesPerTick, int intervalMilliseconds)`

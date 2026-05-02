@@ -10,13 +10,38 @@ dotnet run --project HisBench -- --help
 
 ---
 
+## 0. Measurement API and timers (insert throughput)
+
+**Which API:** HisBench’s insert and duplicate phases call `HistoryAddForBenchmarkAsync`, which hashes message and server IDs, enqueues to the shard writer, and **does not** append the walk/journal (`RecordInserted`). Throughput numbers are **not** comparable to `HistoryAdd` / `HistoryAddAsync`, which perform metadata and optional journal work on every successful insert.
+
+**When `HistorySync` runs:** The benchmark harness calls `HistorySync()` in `finally` after the workload phases complete, before the final `GetPerformanceSnapshot()`. The reported **total elapsed** and **insert throughput (full run clock)** therefore include that sync (and, for phased runs, duplicate and lookup passes). With default large mmap tables, **HistorySync** can take seconds, and **engine cold open** (storage sizing, telemetry read, `HistoryDatabase` construction including mmap/Bloom, then `ConfigureDatabase`) can take many more on a fresh or large tree; the report’s **Clock:** line breaks those out with phased insert/duplicate/lookup wall times so the numbers add up. Use **insert throughput (insert phase only)** for engine-limited insert rate; use the histograms for latency shape.
+
+**Bloom checkpoints:** Default engine behavior uses **throughput** Bloom persistence (`TryWrite` to the persist channel; drops counted as `BloomCheckpointsDropped` in `GetPerformanceSnapshot()`). Use `--bloom-persist durability` to block shard writers until checkpoints are accepted (stronger on-disk Bloom cadence under load).
+
+**Cross-generation duplicate pre-check:** Default `--enqueue-dup-check full` matches production semantics (scan retained generations before enqueue). For synthetic **unique-key** insert-only experiments, `--enqueue-dup-check active-generation-only` removes that scan and can raise peak inserts/sec at the cost of incorrect cross-generation duplicate semantics if the same hash could appear in an older generation.
+
+---
+
+## Profiling the insert hot path
+
+Use a short run and CPU sampling focused on `HistoryDB`:
+
+```bash
+dotnet tool install -g dotnet-trace
+dotnet trace collect --format speedscope --providers Microsoft-DotNETCore-SampleProfiler -- dotnet run -c Release --project HisBench -- --add-count 500000 --add-forks 8
+```
+
+Open the generated `.speedscope.json` in [Speedscope](https://www.speedscope.app/) and search for frames such as `ExistsInGenerationsBeforeOrEqual`, `TryEnqueueBloomPersist`, `CloneWordsLocked`, `BloomFilter64`, `WriteAsync`, and `RunShardWriterAsync`.
+
+---
+
 ## 1. Decide what “maximum performance” means
 
 Before changing knobs, pick one primary goal:
 
 | Goal | What to optimize | HisBench signals |
 |------|------------------|------------------|
-| **Peak inserts/sec** | Offer enough concurrency without drowning the disk or causing probe storms | Insert throughput; insert wall p99; `Insert writer execution` vs `Insert queue wait` |
+| **Peak inserts/sec** | Offer enough concurrency without drowning the disk or causing probe storms | **Insert throughput (insert phase only)** on phased runs; insert wall p99; `Insert writer execution` vs `Insert queue wait` (the full-run insert/sec line divides by total wall time including duplicate + lookup passes and shutdown) |
 | **Stable tail latency** | Avoid queue saturation and excessive table load | Queue wait p99; `PendingQueueItemsApprox`; verdict line |
 | **Disk sustainability** | Fewer large parallel write streams, less mmap working set | Process read/write bytes; storage delta; host disk queue depth (outside HisBench) |
 | **Lookup-heavy** | Bloom trust, generations retained, skew model | Lookup throughput; restart warmup if you use `--restart-test` |
@@ -81,11 +106,13 @@ Each retained generation keeps its own shard set on disk and in the engine’s l
 
 ---
 
-## 7. Bloom checkpoints: `--bloom-checkpoint-interval`
+## 7. Bloom checkpoints: `--bloom-checkpoint-interval` and `--bloom-persist`
 
-Bloom filters are periodically serialized to sidecar files. A **smaller** interval increases **disk write** traffic and can cap insert throughput during sustained load. A **larger** interval reduces that overhead (at the cost of less frequent on-disk Bloom snapshots—acceptable for many synthetic runs).
+Bloom filters are periodically serialized to sidecar files. A **smaller** interval increases **disk write** traffic and can cap insert throughput during sustained load. A **larger** interval reduces that overhead (at the cost of less frequent on-disk Bloom snapshots—acceptable for many synthetic runs). **`--bloom-checkpoint-interval 0` disables** periodic checkpoints entirely.
 
-For **pure insert throughput**, try **increasing** the interval after you have a stable baseline.
+`--bloom-persist throughput` (default) enqueues checkpoints with `TryWrite` and counts drops in the final `BloomCheckpointsDropped` field. `--bloom-persist durability` blocks shard writers until each checkpoint is accepted when the persist channel applies backpressure.
+
+For **pure insert throughput**, try **increasing** the interval (or `0`) after you have a stable baseline; use **durability** only when you need strict checkpoint queuing behavior under overload.
 
 ---
 

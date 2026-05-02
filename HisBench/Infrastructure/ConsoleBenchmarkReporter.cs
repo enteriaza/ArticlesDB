@@ -18,6 +18,11 @@ internal sealed class ConsoleBenchmarkReporter : IBenchmarkReporter
         Console.Error.WriteLine($"Burst={options.BurstMode} profile={options.BurstProfile} duty={I(options.BurstDutyPercent)}% sleep={I(options.BurstSleepMs)}ms, CorrelationSampleMs={I(options.CorrelationSampleMs)}");
         Console.Error.WriteLine($"RestartTest={options.RestartTest}, ColdRestart={options.ColdRestart}");
         Console.Error.WriteLine($"Thresholds: saturationQueue={I(options.SaturationQueueDepthThreshold)}, degradedP99Us={F2(options.DegradedP99Microseconds)}");
+        Console.Error.WriteLine($"BloomPersist={options.BloomCheckpointPersistMode}, EnqueueDupCheck={options.CrossGenerationDuplicateCheck}");
+        Console.Error.WriteLine(
+            options.InsertBatchSize > 0
+                ? $"InsertBatch={I(options.InsertBatchSize)} (writer coalesce ceiling N; adaptive burst up to N; same HistoryAddForBenchmarkAsync enqueue path)"
+                : "InsertBatch=0 (writer coalesce max=1, one single per shard drain)");
         Console.Error.WriteLine();
         Console.Error.WriteLine("WARNING: This program writes garbage entries to the history file");
         Console.Error.WriteLine();
@@ -42,12 +47,41 @@ internal sealed class ConsoleBenchmarkReporter : IBenchmarkReporter
         Console.WriteLine($"Duplicates: attempted={I(m.DuplicateAttempted)}, detected={I(m.DuplicateDetected)}");
         Console.WriteLine($"Lookups: attempted={I(m.LookupAttempted)}, found={I(m.LookupFound)}, miss={I(m.LookupMiss)}");
         Console.WriteLine($"Expires: attempted={I(m.ExpireAttempted)}, applied={I(m.ExpiredOk)}");
-        Console.WriteLine($"Insert throughput: {I((long)SafeRate(m.InsertedOk, report.RunElapsedMilliseconds))} inserts/sec");
-        Console.WriteLine($"Lookup throughput: {I((long)SafeRate(m.LookupAttempted, report.RunElapsedMilliseconds))} lookups/sec");
+        long fullRunInsertPerSec = (long)SafeRate(m.InsertedOk, report.RunElapsedMilliseconds);
+        Console.WriteLine($"Insert throughput (full run clock): {I(fullRunInsertPerSec)} inserts/sec");
+        if (m.InsertPhaseElapsedMs > 0)
+        {
+            Console.WriteLine(
+                $"Insert throughput (insert phase only): {I((long)SafeRate(m.InsertedOk, m.InsertPhaseElapsedMs))} inserts/sec over {I(m.InsertPhaseElapsedMs)} ms");
+            Console.WriteLine($"Phased wall: duplicate pass {I(m.DuplicatePhaseElapsedMs)} ms, lookup pass {I(m.LookupPhaseElapsedMs)} ms");
+            long phasedSum = m.InsertPhaseElapsedMs + m.DuplicatePhaseElapsedMs + m.LookupPhaseElapsedMs;
+            long accounted =
+                m.DatabaseOpenConfigureElapsedMs +
+                phasedSum +
+                m.HistorySyncElapsedMs +
+                m.SamplerShutdownElapsedMs;
+            long residual = report.RunElapsedMilliseconds - accounted;
+            Console.WriteLine(
+                $"Clock: phased work {I(phasedSum)} ms + engine cold open {I(m.DatabaseOpenConfigureElapsedMs)} ms (telemetry + HistoryDatabase ctor + ConfigureDatabase) + HistorySync {I(m.HistorySyncElapsedMs)} ms + sampler shutdown {I(m.SamplerShutdownElapsedMs)} ms ≈ {I(accounted)} ms (residual {I(residual)} ms)");
+        }
+        else if (m.DatabaseOpenConfigureElapsedMs > 0 || m.HistorySyncElapsedMs > 0)
+        {
+            Console.WriteLine(
+                $"Clock: engine cold open {I(m.DatabaseOpenConfigureElapsedMs)} ms + HistorySync {I(m.HistorySyncElapsedMs)} ms + sampler shutdown {I(m.SamplerShutdownElapsedMs)} ms");
+        }
+
+        long fullRunLookupPerSec = (long)SafeRate(m.LookupAttempted, report.RunElapsedMilliseconds);
+        Console.WriteLine($"Lookup throughput (full run clock): {I(fullRunLookupPerSec)} lookups/sec");
+        if (m.LookupPhaseElapsedMs > 0 && m.LookupAttempted > 0)
+        {
+            Console.WriteLine(
+                $"Lookup throughput (lookup phase only): {I((long)SafeRate(m.LookupAttempted, m.LookupPhaseElapsedMs))} lookups/sec over {I(m.LookupPhaseElapsedMs)} ms");
+        }
+
         Console.WriteLine();
 
         Console.WriteLine("[Engine Health]");
-        Console.WriteLine($"Generation={I(snap.ActiveGenerationId)}, Retained={I(snap.RetainedGenerations)}, QueueApprox={I(snap.PendingQueueItemsApprox)}, FullFails={I(snap.FullInsertFailures)}, ProbeFails={I(snap.ProbeLimitFailures)}");
+        Console.WriteLine($"Generation={I(snap.ActiveGenerationId)}, Retained={I(snap.RetainedGenerations)}, QueueApprox={I(snap.PendingQueueItemsApprox)}, FullFails={I(snap.FullInsertFailures)}, ProbeFails={I(snap.ProbeLimitFailures)}, BloomCkptDropped={I(snap.BloomCheckpointsDropped)}");
         Console.WriteLine(snap.FullInsertFailures == 0 && snap.ProbeLimitFailures == 0
             ? "Interpretation: No shard pressure failures observed."
             : "Interpretation: Pressure/failure signals observed; inspect thresholds and capacity.");

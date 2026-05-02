@@ -34,7 +34,7 @@ internal enum SlotScrubOutcome
 /// <summary>
 /// Result of an insert-or-probe operation against a single mmap-backed shard.
 /// </summary>
-internal enum ShardInsertResult
+public enum ShardInsertResult
 {
     /// <summary>An empty slot was filled with the new hash and server payload.</summary>
     Inserted = 0,
