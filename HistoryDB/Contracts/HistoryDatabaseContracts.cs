@@ -22,7 +22,7 @@ internal interface IHistoryMetadataStore
     int Walk(ref long position, out HistoryWalkEntry entry);
 }
 
-internal readonly record struct Hash128(ulong Hi, ulong Lo);
+public readonly record struct Hash128(ulong Hi, ulong Lo);
 
 internal readonly record struct HistoryWriterMetrics(
     int ActiveGenerationId,

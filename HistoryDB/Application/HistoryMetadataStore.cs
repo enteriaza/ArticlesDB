@@ -4,6 +4,8 @@ using System.Globalization;
 using System.Text;
 
 using HistoryDB.Contracts;
+using HistoryDB.Utilities;
+
 using Microsoft.Extensions.Logging;
 
 namespace HistoryDB.Application;
@@ -15,7 +17,7 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
     private readonly object _stateLock = new();
     private readonly object _journalWriteLock = new();
     private readonly HashSet<Hash128> _expired = [];
-    private readonly LinkedList<JournalEntry> _walkEntries = new();
+    private readonly LinkedList<HistoryWalkEntry> _walkEntries = new();
     private readonly IMessageHashProvider _hashProvider;
     private readonly ILogger _logger;
     private readonly int _maxWalkEntriesInMemory;
@@ -56,7 +58,8 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
         lock (_stateLock)
         {
             _expired.Remove(messageHash);
-            AppendWalkEntry_NoLock(new JournalEntry(new HistoryWalkEntry(messageId, serverId, createdAtUtc), messageHash));
+            AppendWalkEntry_NoLock(new HistoryWalkEntry(messageId, serverId, createdAtUtc, messageHash));
+            PersistExpiredSetCore_NoLock();
         }
 
         AppendJournalLine(messageId, serverId, messageHash, createdAtUtc);
@@ -66,15 +69,21 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
     {
         lock (_stateLock)
         {
-            return _expired.Add(messageHash);
+            if (!_expired.Add(messageHash))
+            {
+                return false;
+            }
+
+            PersistExpiredSetCore_NoLock();
+            return true;
         }
     }
 
     public int Expire(ReadOnlySpan<Hash128> messageHashes)
     {
-        int changed = 0;
         lock (_stateLock)
         {
+            int changed = 0;
             for (int i = 0; i < messageHashes.Length; i++)
             {
                 if (_expired.Add(messageHashes[i]))
@@ -82,25 +91,21 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
                     changed++;
                 }
             }
-        }
 
-        return changed;
+            if (changed > 0)
+            {
+                PersistExpiredSetCore_NoLock();
+            }
+
+            return changed;
+        }
     }
 
     public void PersistExpiredSet()
     {
         lock (_stateLock)
         {
-            byte[] payload = new byte[_expired.Count * 16];
-            int offset = 0;
-            foreach (Hash128 hash in _expired)
-            {
-                BitConverter.TryWriteBytes(payload.AsSpan(offset, 8), hash.Hi);
-                BitConverter.TryWriteBytes(payload.AsSpan(offset + 8, 8), hash.Lo);
-                offset += 16;
-            }
-
-            File.WriteAllBytes(_expiredPath, payload);
+            PersistExpiredSetCore_NoLock();
         }
     }
 
@@ -120,7 +125,7 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
                 return 0;
             }
 
-            LinkedListNode<JournalEntry>? node = _walkEntries.First;
+            LinkedListNode<HistoryWalkEntry>? node = _walkEntries.First;
             for (long i = 0; i < localIndex && node is not null; i++)
             {
                 node = node.Next;
@@ -128,7 +133,7 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
 
             while (node is not null)
             {
-                JournalEntry current = node.Value;
+                HistoryWalkEntry current = node.Value;
                 position++;
                 node = node.Next;
                 if (_expired.Contains(current.MessageHash))
@@ -136,7 +141,7 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
                     continue;
                 }
 
-                entry = current.Entry;
+                entry = current;
                 return 1;
             }
         }
@@ -152,7 +157,23 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
             return;
         }
 
+        if (ExpiredSetFile.TryLoadFormatted(_expiredPath, _expired, out string? formattedError))
+        {
+            if (formattedError is not null)
+            {
+                throw new InvalidDataException(formattedError);
+            }
+
+            return;
+        }
+
         byte[] bytes = File.ReadAllBytes(_expiredPath);
+        if (bytes.Length % 16 != 0)
+        {
+            throw new InvalidDataException(
+                $"Legacy expired-md5.bin length {bytes.Length} is not a multiple of 16 bytes (partial write or corruption).");
+        }
+
         for (int offset = 0; offset + 16 <= bytes.Length; offset += 16)
         {
             ulong hi = BitConverter.ToUInt64(bytes, offset);
@@ -172,17 +193,17 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
         foreach (string line in File.ReadLines(_journalPath))
         {
             lineNumber++;
-            if (!TryParseJournalLine(line, out JournalEntry entry))
+            if (!TryParseJournalLine(line, out HistoryWalkEntry walkEntry))
             {
                 LogInvalidJournalLine(_logger, _journalPath, lineNumber);
                 continue;
             }
 
-            AppendWalkEntry_NoLock(entry);
+            AppendWalkEntry_NoLock(walkEntry);
         }
     }
 
-    private void AppendWalkEntry_NoLock(JournalEntry entry)
+    private void AppendWalkEntry_NoLock(HistoryWalkEntry entry)
     {
         _walkEntries.AddLast(entry);
         if (_maxWalkEntriesInMemory > 0)
@@ -195,9 +216,12 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
         }
     }
 
-    private bool TryParseJournalLine(string line, out JournalEntry entry)
+    private void PersistExpiredSetCore_NoLock() =>
+        ExpiredSetFile.WriteAtomic(_expiredPath, _expired);
+
+    private bool TryParseJournalLine(string line, out HistoryWalkEntry walkEntry)
     {
-        entry = default;
+        walkEntry = default;
         string[] parts = line.Split('|');
         if (parts.Length is not 3 and not 5)
         {
@@ -229,9 +253,7 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
                 messageHash = _hashProvider.ComputeHash(messageId);
             }
 
-            entry = new JournalEntry(
-                new HistoryWalkEntry(messageId, serverId, new DateTimeOffset(ticks, TimeSpan.Zero)),
-                messageHash);
+            walkEntry = new HistoryWalkEntry(messageId, serverId, new DateTimeOffset(ticks, TimeSpan.Zero), messageHash);
             return true;
         }
         catch (FormatException)
@@ -255,6 +277,4 @@ internal sealed partial class HistoryMetadataStore : IHistoryMetadataStore
 
     [LoggerMessage(EventId = 2000, Level = LogLevel.Warning, Message = "Ignoring invalid HistoryDB journal line {LineNumber} in {JournalPath}.")]
     private static partial void LogInvalidJournalLine(ILogger logger, string journalPath, int lineNumber);
-
-    private readonly record struct JournalEntry(HistoryWalkEntry Entry, Hash128 MessageHash);
 }

@@ -9,8 +9,9 @@
 
 This repository currently contains:
 
-- `HistoryDB`: the core sharded, generation-based history library
+- `HistoryDB`: the core sharded, generation-based history library (optional `HistoryDatabaseHostedService` for Generic Host shutdown ordering)
 - `HisBench`: a benchmark and tuning harness for measuring throughput, latency, queue behavior, and restart warmup
+- `HisCTL`: operator CLI for **scan**, **repair**, **defrag**, and **bulk expire** (time- and LRU-style recycle policies)
 
 ## Project goals
 
@@ -18,6 +19,26 @@ This repository currently contains:
 - Sustain high insert rates with bounded contention.
 - Keep storage layout operationally simple (memory-mapped shard files + Bloom sidecars).
 - Offer practical benchmarking and tuning workflows for real hardware.
+- Provide **operator-grade** tooling for **consistency checks**, **repair**, **defrag**, and **policy-driven expiration** without ad-hoc scripts.
+
+## History lifecycle: checks, repair, defrag, and expiration
+
+ArticlesDB is not only a fast duplicate filter: **HistoryDB** now supports a full **on-disk lifecycle** — diagnostics, safe repair, compaction, and **bulk expiry** — surfaced for operators through **HisCTL** and through public APIs on `HistoryDatabase`.
+
+| Concern | Mechanism | Notes |
+|--------|-----------|--------|
+| **Consistency check** | `HistoryDatabase.ScanAsync` | Default **exclusive** probe opens (strongest view). **`HistoryScanOptions.UseSharedRead`** (HisCTL: `scan --shared`) allows read-shared opens while a server keeps the tree mapped; findings are best-effort under load. |
+| **Repair** | `HistoryDatabase.RepairAsync` | **Exclusive**; quarantine or fail-fast policies; Bloom / header / expired-set hygiene. Run with the history **closed** by other processes. |
+| **Defrag** | `HistoryDatabase.HistoryDefragAsync` | Online compaction across retained generations; coordinate with other writers per ops guidance. |
+| **Single-message expire** | `HistoryExpire` / `HistoryExpire(string[])` | Existing API; tombstones + `expired-md5.bin`. |
+| **Bulk expire by hash** | `HistoryExpireByHashesAsync` + slot harvest | Adds many hashes, batched tombstones, persists expired set; HisCTL wraps harvest + selection. |
+| **Time-based bulk expire** | HisCTL `expire time` + `INTERVAL …` | Cutoff = `UtcNow - interval`; compare **obtained** or **accessed** slot ticks (MySQL-style units; see `MySqlIntervalExpression`). |
+| **LRU-style bulk expire** | HisCTL `expire recycle --limit N` | Ranks occupied slots by **last access**, then **access counter**, then **insert time**, then hash — **stale-first** with **LFU-style** tie-break; default **dry-run**, **`--apply`** to mutate. |
+
+> **Milestone — first NNTP history store here with LRU-style expiration policies.**  
+> **ArticlesDB HistoryDB is the first NNTP-oriented history database in this codebase to ship first-class, operator-controlled bulk expiration under LRU-style ordering** (`expire recycle`) **alongside TTL-style age expiry** (`expire time` / `INTERVAL`). Traditional NNTP histories emphasized duplicate suppression and growth; **HistoryDB + HisCTL** add a **policy-driven reclamation path** at the shard layer (tombstones, persisted expired hashes, generation-aware fan-out) so capacity planning can target **least-recently / least-frequently used** article hashes, not only message-at-a-time expiry.
+
+Operator-focused documentation: [HisCTL/README.md](HisCTL/README.md). Library APIs and scan/repair/defrag semantics: [HistoryDB/README.md](HistoryDB/README.md).
 
 ## Performance Characteristics
 
@@ -94,13 +115,22 @@ These are empirical runs from this repository and are intended as directional re
   - CLI benchmark app for phased and mixed workloads.
   - Includes auto-tuning mode and restart analysis.
   - Detailed docs: `HisBench/README.md`, `HisBench/TUNING.md`.
+- `HisCTL/`
+  - Operator CLI: `scan`, `repair`, `defrag`, `expire` (time + recycle).
+  - Detailed docs: `HisCTL/README.md`.
 
 ## Quick start
 
 Build everything:
 
 ```bash
-dotnet build HisBench/HisBench.csproj -c Release
+dotnet build ArticleDatabase.sln -c Release
+```
+
+Run **HisCTL** help (scan / repair / defrag / expire):
+
+```bash
+dotnet run --project HisCTL -- --help
 ```
 
 Run benchmark help:

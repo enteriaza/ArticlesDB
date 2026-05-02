@@ -10,14 +10,17 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="HisBench" />
+    <InternalsVisibleTo Include="HisCTL" />
     <InternalsVisibleTo Include="HistoryDB.Tests" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="HdrHistogram" Version="2.5.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.7" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.7" />
     <PackageReference Include="System.Net.Http" Version="4.3.4" />
     <PackageReference Include="System.Text.RegularExpressions" Version="4.3.1" />
+    <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
   </ItemGroup>
 
 </Project>

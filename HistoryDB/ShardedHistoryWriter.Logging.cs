@@ -19,17 +19,26 @@ internal sealed partial class ShardedHistoryWriter
     [LoggerMessage(EventId = 1003, Level = LogLevel.Debug, Message = "Background slot scrubber started.")]
     private partial void LogSlotScrubberStarted();
 
-    [LoggerMessage(EventId = 1004, Level = LogLevel.Critical, Message = "EnqueueAsync failed unexpectedly. Returning Full to prevent host crash.")]
+    [LoggerMessage(EventId = 1004, Level = LogLevel.Critical, Message = "EnqueueAsync failed with an unexpected exception (not I/O or disposal). Returning Full.")]
     private partial void LogEnqueueFailedCritical(Exception ex);
 
-    [LoggerMessage(EventId = 1005, Level = LogLevel.Error, Message = "Exists failed unexpectedly; returning false for safety.")]
-    private partial void LogExistsFailed(Exception ex);
+    [LoggerMessage(EventId = 1026, Level = LogLevel.Error, Message = "EnqueueAsync failed with I/O or access error; rethrowing.")]
+    private partial void LogEnqueueIoFailed(Exception ex);
+
+    [LoggerMessage(EventId = 1036, Level = LogLevel.Error, Message = "Exists failed with an unexpected non-I/O exception; returning false for safety.")]
+    private partial void LogExistsUnexpectedException(Exception ex);
+
+    [LoggerMessage(EventId = 1027, Level = LogLevel.Error, Message = "Exists failed with I/O or access error; rethrowing.")]
+    private partial void LogExistsIoFailed(Exception ex);
 
     [LoggerMessage(EventId = 1006, Level = LogLevel.Information, Message = "HistoryDB stop requested.")]
     private partial void LogStopRequested();
 
     [LoggerMessage(EventId = 1007, Level = LogLevel.Error, Message = "Shutdown wait completed with unexpected error.")]
     private partial void LogShutdownWaitFailed(Exception ex);
+
+    [LoggerMessage(EventId = 1030, Level = LogLevel.Error, Message = "Shutdown: background task faulted (taskIndex={TaskIndex}).")]
+    private partial void LogShutdownWriterTaskFaulted(int taskIndex, Exception ex);
 
     [LoggerMessage(EventId = 1008, Level = LogLevel.Error, Message = "Shard dispose failed during shutdown (generation={GenerationId}, shard={ShardId}).")]
     private partial void LogShardDisposeFailedDuringShutdown(Exception ex, int generationId, int shardId);
@@ -82,6 +91,42 @@ internal sealed partial class ShardedHistoryWriter
     [LoggerMessage(EventId = 1024, Level = LogLevel.Critical, Message = "Shard writer loop crashed (generation={GenerationId}, shard={ShardId}). Pending requests are faulted.")]
     private partial void LogShardWriterCrashed(Exception ex, int generationId, int shardId);
 
-    [LoggerMessage(EventId = 1025, Level = LogLevel.Warning, Message = "Bloom checkpoint dropped because persist queue is full: {Path}.")]
-    private partial void LogBloomCheckpointDropped(string path);
+    [LoggerMessage(EventId = 1025, Level = LogLevel.Information, Message = "Bloom checkpoint queue full; wrote synchronously: {Path}.")]
+    private partial void LogBloomCheckpointSyncFallback(string path);
+
+    [LoggerMessage(EventId = 1100, Level = LogLevel.Error, Message = "Compaction sibling preparation failed (generation={GenerationId}, sibling={SiblingDir}).")]
+    private partial void LogCompactSiblingPrepareFailed(Exception ex, int generationId, string siblingDir);
+
+    [LoggerMessage(EventId = 1101, Level = LogLevel.Error, Message = "Compaction build failed (generation={GenerationId}).")]
+    private partial void LogCompactBuildFailed(Exception ex, int generationId);
+
+    [LoggerMessage(EventId = 1102, Level = LogLevel.Warning, Message = "Compaction sibling cleanup failed (generation={GenerationId}, sibling={SiblingDir}).")]
+    private partial void LogCompactSiblingCleanupFailed(Exception ex, int generationId, string siblingDir);
+
+    [LoggerMessage(EventId = 1103, Level = LogLevel.Warning, Message = "Compaction drain of source generation {GenerationId} writers reported failure.")]
+    private partial void LogCompactDrainFailed(Exception ex, int generationId);
+
+    [LoggerMessage(EventId = 1104, Level = LogLevel.Error, Message = "Compaction atomic swap failed (generation={GenerationId}).")]
+    private partial void LogCompactSwapFailed(Exception ex, int generationId);
+
+    [LoggerMessage(EventId = 1105, Level = LogLevel.Error, Message = "Compaction re-open failed (generation={GenerationId}).")]
+    private partial void LogCompactReopenFailed(Exception ex, int generationId);
+
+    [LoggerMessage(EventId = 1106, Level = LogLevel.Warning, Message = "Compaction retired-source cleanup failed: {Path}.")]
+    private partial void LogCompactRetiredCleanupFailed(Exception ex, string path);
+
+    [LoggerMessage(EventId = 1107, Level = LogLevel.Information, Message = "Compaction completed (generation={GenerationId}, slotsScanned={SlotsScanned}, survivors={Survivors}, expiredDropped={ExpiredDropped}, tombstonesDropped={TombstonesDropped}, bytesReclaimed={BytesReclaimed}).")]
+    private partial void LogCompactCompleted(int generationId, long slotsScanned, long survivors, long expiredDropped, long tombstonesDropped, long bytesReclaimed);
+
+    [LoggerMessage(EventId = 1108, Level = LogLevel.Warning, Message = "Compaction skipped: insufficient disk space (generation={GenerationId}, availableBytes={AvailableBytes}, minimumRequired={MinimumRequired}).")]
+    private partial void LogCompactSkippedLowDisk(int generationId, long availableBytes, ulong minimumRequired);
+
+    [LoggerMessage(EventId = 1032, Level = LogLevel.Warning, Message = "Directory size probe failed for {Path}: {Message}. Directory reclaim metrics may be inaccurate.")]
+    private partial void LogDirectorySizeProbeAccessDenied(string path, string message);
+
+    [LoggerMessage(EventId = 1033, Level = LogLevel.Warning, Message = "Bloom persistence skipped: circuit breaker is open.")]
+    private partial void LogBloomPersistSkippedOpenCircuit();
+
+    [LoggerMessage(EventId = 1034, Level = LogLevel.Warning, Message = "Bloom checkpoint skipped for low disk space at {Path} (available={AvailableBytes}, minimum={MinimumRequired}).")]
+    private partial void LogBloomCheckpointSkippedLowDisk(string path, long availableBytes, ulong minimumRequired);
 }

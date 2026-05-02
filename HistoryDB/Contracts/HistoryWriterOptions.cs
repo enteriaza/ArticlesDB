@@ -26,6 +26,9 @@ internal sealed record HistoryWriterOptions
     public SlotScrubberOptions SlotScrubber { get; init; } = new();
 
     public AffinityOptions Affinity { get; init; } = new();
+
+    /// <summary>When non-zero, compaction and bloom checkpoints skip when available space on the data drive falls below this value (bytes).</summary>
+    public ulong MinimumFreeDiskBytes { get; init; }
 }
 
 internal sealed record BloomOptions

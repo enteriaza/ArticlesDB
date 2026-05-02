@@ -29,6 +29,10 @@ A shard is a fixed-size memory-mapped hash table (`IShardStore`) with:
 - optional payload fields (`serverHi`, `serverLo`)
 - probe-limit and load-factor protections
 
+**On-disk format:** header `version` is always **1**. Table stride follows file length: **56 bytes** per slot (payload only) or **60 bytes** (payload plus little-endian **CRC32**, IEEE, over the first 56 bytes). New shard files use the CRC layout; older trees without the suffix remain readable. `HistorySync` best-effort **flushes** mapped shard views after header updates.
+
+**`expired-md5.bin`:** new deployments write a **versioned header + payload CRC + hash list** and replace the file **atomically** (temp + flush + move). Legacy raw files (length multiple of 16) still load; malformed lengths fail startup with a clear error.
+
 ### Bloom sidecar
 
 Each shard can have a Bloom sidecar that accelerates `Exists(...)` by skipping shard probes when membership is impossible.
@@ -39,11 +43,21 @@ The public API is intentionally small:
 
 - `HistoryDatabase(...)` (initialization)
 - `bool HistoryLookup(string messageId)`
+- `ValueTask<bool> HistoryLookupAsync(string messageId, CancellationToken)`
 - `bool HistoryAdd(string messageId, string serverId)`
+- `ValueTask<bool> HistoryAddAsync(string messageId, string serverId, CancellationToken)`
 - `bool HistoryExpire(string messageId)`
 - `int HistoryExpire(string[] messageIds)`
+- `Task<int> HistoryExpireByHashesAsync(IReadOnlyList<Hash128> hashes, int parallelTombstones = 64, CancellationToken cancellationToken = default)` (bulk tombstone + persist)
+- `IAsyncEnumerable<StoredArticleMetadata> EnumerateStoredArticleMetadataAsync(bool skipIfExpired = true, CancellationToken cancellationToken = default)` (read-only slot harvest)
+- `bool IsMessageHashExpired(Hash128 messageHash)`
 - `void HistorySync()`
+- `HistoryHealthSnapshot GetHealthSnapshot()` (journal / bloom circuit flags and journal dirty marker)
+- `IReadOnlyList<Exception> GetShutdownFaults()` (writer background task faults observed during shutdown)
 - `int HistoryWalk(ref long position, out HistoryWalkEntry entry, int flags = 0)`
+- `Task<HistoryDefragReport> HistoryDefragAsync(HistoryDefragOptions? options = null, CancellationToken cancellationToken = default)` (online defrag)
+- `static Task<HistoryRepairReport> HistoryDatabase.ScanAsync(string rootPath, ...)` (offline diagnostic)
+- `static Task<HistoryRepairReport> HistoryDatabase.RepairAsync(string rootPath, HistoryRepairOptions options, ...)` (offline repair)
 
 Performance tuning methods:
 
@@ -83,6 +97,18 @@ db.HistoryExpire("<message-id@host>");
 db.HistorySync();
 ```
 
+## Generic Host shutdown
+
+For **ASP.NET Core** or `Microsoft.Extensions.Hosting` hosts, register `HistoryDatabase` as a singleton and add `HistoryDatabaseHostedService` so `StopAsync` flushes the journal and disposes mmap-backed writers **before** the process exits:
+
+```csharp
+using HistoryDB;
+using HistoryDB.Application;
+
+services.AddSingleton(sp => new HistoryDatabase(rootPath, logger: sp.GetRequiredService<ILogger<HistoryDatabase>>()));
+services.AddHostedService(sp => new HistoryDatabaseHostedService(sp.GetRequiredService<HistoryDatabase>()));
+```
+
 ## Architecture Overview
 
 ```mermaid
@@ -98,11 +124,70 @@ flowchart LR
     writer --> numa[INumaTopologyService]
 ```
 
+## Scan and repair
+
+`HistoryDB` ships a scan / repair engine for the on-disk artifacts: shard data files (`.dat`), Bloom sidecars (`.idx`), the expired-hash set (`expired-md5.bin`), and the durable journal (`history-journal.log`). **`RepairAsync`** is **offline**: no `HistoryDatabase` instance may be open on that root; the engine probes with `FileShare.None` first and aborts with `LockedByOtherProcess` if anything is locked.
+
+**`ScanAsync`** is always read-only. By default it uses the same exclusive probe semantics as repair (strongest consistency). For **live diagnostics**, pass `HistoryScanOptions { UseSharedRead = true }` so scan-only opens use shared read access while a running `HistoryDatabase` holds the tree; results are best-effort under concurrent writers (see [HisCTL/README.md](../HisCTL/README.md)).
+
+- `HistoryDatabase.ScanAsync(rootPath, ...)` &mdash; read-only diagnostic; produces a structured `HistoryRepairReport` and never writes.
+- `HistoryDatabase.RepairAsync(rootPath, options, ...)` &mdash; applies safe fixes per `HistoryRepairOptions`. Non-destructive recomputations (header watermarks, Bloom sidecar bits, expired-set tail truncation, optional journal rewrite) run under both policies. Unrecoverable shard `.dat` data is only renamed (`{name}.corrupt-{utcTicks:x}`) when `Policy = QuarantineAndRecreate`; otherwise it is reported and left untouched (`Policy = FailFast`, the default).
+
+```csharp
+using HistoryDB;
+using HistoryDB.Repair;
+
+// Diagnostic scan. Safe to invoke against any directory; never mutates files.
+HistoryRepairReport scan = await HistoryDatabase.ScanAsync(@"C:\historydb");
+foreach (RepairFinding finding in scan.Findings)
+{
+    Console.WriteLine($"{finding.Severity} {finding.Code}: {finding.Path} -- {finding.Detail}");
+}
+
+// Apply repairs. Default policy leaves unrecoverable shard data untouched.
+HistoryRepairReport repair = await HistoryDatabase.RepairAsync(
+    @"C:\historydb",
+    new HistoryRepairOptions
+    {
+        Policy = RepairPolicy.QuarantineAndRecreate,
+        RewriteJournalDroppingInvalidLines = true,
+    });
+
+Console.WriteLine($"Healthy={repair.IsHealthy}, headersRewritten={repair.HeadersRewritten}, bloomsRewritten={repair.BloomSidecarsRewritten}, quarantined={repair.FilesQuarantined}");
+```
+
+## Online defrag
+
+Expiration alone records MD5 hashes in `expired-md5.bin` and filters `HistoryLookup` / `HistoryWalk`; slots stay occupied on disk until something physically removes them. **`HistoryExpire` also issues a best-effort tombstone broadcast** (fire-and-forget): the matching slot in each retained generation is rewritten to a reserved sentinel (`hash_hi == 1`, `hash_lo == 0`) so probes treat it like a gap for new inserts (reclamation) and defrag can drop it without shifting slot data in place.
+
+**`HistoryDefragAsync`** compacts **non-active** retained generations: it rebuilds each candidate into a sibling directory under `{root}/{gen:x5}-defrag-tmp/`, copies only survivors (not expired, not tombstoned), rebuilds Bloom sidecars, then atomically swaps the generation under the writer lifecycle lock. The old directory is renamed to `{token}.compact-old-{utcTicks:x}/` and deleted asynchronously. With **`ForceRolloverActiveGeneration`** (default `true`), the writer rolls over first so the previously active generation becomes a compaction target; concurrent inserts therefore land on the new active generation.
+
+**Disk:** expect roughly **2×** a generation’s footprint until the swap finishes. Tune **`MinExpiredFractionToCompact`** to skip generations with little reclaimable data, and **`MaxParallelGenerations`** to cap how many generations compact at once.
+
+Tombstones are **slot payload** values (`hash_hi == 1`, `hash_lo == 0`), not a separate on-disk header version.
+
+```csharp
+using HistoryDB;
+using HistoryDB.Defrag;
+
+HistoryDefragReport defrag = await db.HistoryDefragAsync(new HistoryDefragOptions
+{
+    ForceRolloverActiveGeneration = true,
+    MinExpiredFractionToCompact = 0.05,
+    MaxParallelGenerations = 1,
+    PruneExpiredSetAfterCompaction = true,
+});
+
+Console.WriteLine(
+    $"Compacted={defrag.GenerationsCompacted}, survivors={defrag.SurvivorsCopied}, " +
+    $"dropped expired={defrag.ExpiredEntriesDropped}, dropped tombstones={defrag.TombstonesDropped}, pruned expired-file={defrag.ExpiredEntriesPruned}");
+```
+
 ## Operational Notes
 
 - **Durability model:** hash state lives in memory-mapped shard files; Bloom sidecars are best-effort accelerators.
 - **Hashing model:** public `messageId` and `serverId` strings are internally hashed with MD5 and stored as 128-bit values.
-- **Expire model:** expiration is managed explicitly by API calls and applied by lookup/walk logic.
+- **Expire model:** expiration is managed explicitly by API calls and applied by lookup/walk logic; tombstones plus `HistoryDefragAsync` reclaim disk and reduce effective load in older generations.
 - **Backpressure:** Bloom checkpoint persistence queue is bounded; drops are logged.
 - **Logging:** structured logs use `Microsoft.Extensions.Logging` with source-generated `[LoggerMessage]` methods.
 - **Fallback logger:** when no `ILogger` is provided, logging falls back to `System.Diagnostics.Trace`.
